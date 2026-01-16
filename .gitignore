@@ -2,6 +2,7 @@
 /target
 **/*.rs.bk
 *.pdb
+Cargo.lock
 
 # IDE
 .vscode/
@@ -11,28 +12,18 @@
 *~
 .DS_Store
 
-# Configuration (contains private keys)
-config.toml
-keys.toml
+# Configuration (contains private keys!)
+purl.toml
+*.toml
+!purl.toml.example
+!Cargo.toml
 
 # Build artifacts
+purl
 *.tar.gz
-
-# Eval (promptfoo output and old run artifacts)
-eval/runs/
-eval/output/
 
 # Logs
 *.log
 
 # OS
 Thumbs.db
-
-# Node
-node_modules/
-package-lock.json
-.ai/
-!.ai/skills/
-.env
-.env.*
-!.env.example
