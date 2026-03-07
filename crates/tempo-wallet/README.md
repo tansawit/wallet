@@ -1,6 +1,6 @@
 # tempo-wallet
 
-Wallet identity and custody extension for the Tempo CLI. Manages authentication, key lifecycle, and funding.
+Wallet identity and custody extension for the Tempo CLI. Manages wallet creation, authentication, key management, and funding.
 
 ## Commands
 
@@ -10,18 +10,15 @@ Wallet identity and custody extension for the Tempo CLI. Manages authentication,
 | `tempo wallet logout` | Disconnect your wallet |
 | `tempo wallet whoami` | Show wallet address, balances, keys, and readiness |
 | `tempo wallet keys` | List keys with balance and spending limit details |
-| `tempo wallet fund` | Fund your wallet (opens browser) |
-| `tempo wallet sessions list` | List payment sessions |
-| `tempo wallet sessions close` | Close by origin or channel ID, or batch close/finalize/orphaned |
-| `tempo wallet sessions sync` | Reconcile local sessions against on-chain state |
-| `tempo wallet services` | Browse the MPP service directory |
-| `tempo wallet mpp-sign` | Sign an MPP payment challenge |
+| `tempo wallet wallets create` | Create a new local wallet |
+| `tempo wallet wallets list` | List configured wallets |
+| `tempo wallet completions <SHELL>` | Generate shell completions |
 
 ## Usage
 
 ```bash
 # Install
-curl -fsSL https://tempo.xyz/install | bash
+curl -fsSL https://cli.tempo.xyz/install | bash
 
 # Connect your wallet
 tempo wallet login

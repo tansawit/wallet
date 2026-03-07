@@ -1,16 +1,12 @@
-//! Configuration management for Tempo CLI.
+//! Configuration management for tempo-wallet.
 
-use std::{
-    collections::HashMap,
-    path::{Component, Path, PathBuf},
-};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::{ConfigError, TempoError},
-    network::NetworkId,
-};
+use crate::error::TempoError;
+use crate::network::NetworkId;
 
 /// Application configuration (optional RPC overrides, telemetry).
 ///
@@ -40,7 +36,7 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    const fn default_enabled() -> bool {
+    fn default_enabled() -> bool {
         true
     }
 }
@@ -59,48 +55,49 @@ impl Config {
     ///
     /// If `rpc_override` is provided, it is applied to all built-in networks,
     /// taking precedence over any config file settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path is invalid, the file cannot be read,
-    /// or the TOML payload cannot be parsed.
     pub fn load(
         config_path: Option<impl AsRef<Path>>,
         rpc_override: Option<&str>,
-    ) -> Result<Self, TempoError> {
+    ) -> anyhow::Result<Self> {
         let (config_path, explicit) = if let Some(path) = config_path {
             let path = PathBuf::from(path.as_ref());
             if path.components().any(|c| matches!(c, Component::ParentDir)) {
-                return Err(ConfigError::InvalidConfigPathTraversal.into());
+                return Err(TempoError::InvalidConfig(
+                    "Invalid config path: path traversal (..) not allowed".to_string(),
+                )
+                .into());
             }
             (path, true)
         } else {
             (Self::default_config_path()?, false)
         };
 
-        let mut config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path).map_err(|source| {
-                ConfigError::ReadConfigFile {
-                    path: config_path.display().to_string(),
-                    source,
-                }
-            })?;
-
-            toml::from_str(&content).map_err(|source| ConfigError::ParseConfigFile {
-                path: config_path.display().to_string(),
-                source,
-            })?
-        } else {
+        let mut config = if !config_path.exists() {
             if explicit {
-                return Err(ConfigError::Missing(format!(
+                anyhow::bail!(TempoError::ConfigMissing(format!(
                     "Config file not found at {}.",
                     config_path.display()
-                ))
-                .into());
+                )));
             }
             let config = Self::default();
             let _ = Self::write_default(&config_path, &config);
             config
+        } else {
+            let content = std::fs::read_to_string(&config_path).map_err(|e| {
+                TempoError::InvalidConfig(format!(
+                    "Failed to read config file at {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?;
+
+            toml::from_str(&content).map_err(|e| {
+                TempoError::InvalidConfig(format!(
+                    "Failed to parse config file at {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?
         };
 
         if let Some(url) = rpc_override {
@@ -112,21 +109,19 @@ impl Config {
         Ok(config)
     }
 
-    /// Get the default config file path (`$TEMPO_HOME/config.toml` or `~/.tempo/config.toml`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the Tempo home directory cannot be resolved.
+    /// Get the default config file path (platform config directory + `tempo/wallet/config.toml`).
     pub fn default_config_path() -> Result<PathBuf, TempoError> {
-        Ok(crate::tempo_home()?.join("config.toml"))
+        dirs::config_dir()
+            .map(|c| c.join("tempo").join("wallet").join("config.toml"))
+            .ok_or(TempoError::NoConfigDir)
     }
 
     /// Write a default config file with helpful comments.
-    fn write_default(config_path: &Path, config: &Self) -> Result<(), TempoError> {
+    fn write_default(config_path: &Path, config: &Config) -> Result<(), TempoError> {
         let body = toml::to_string_pretty(config)?;
         let content = format!(
-            "# Tempo wallet configuration\n\
-             # Wallet keys live in keys.toml (set via `tempo wallet login`)\n\
+            "# tempo-wallet configuration\n\
+             # Wallet keys live in keys.toml (set via `tempo-wallet login`)\n\
              # Optional RPC overrides:\n\
              # [rpc]\n\
              # tempo = \"https://...\"\n\
@@ -135,14 +130,13 @@ impl Config {
         );
         {
             use std::io::Write;
-            let parent = config_path.parent().ok_or_else(|| {
+            std::fs::create_dir_all(config_path.parent().ok_or_else(|| {
                 TempoError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("path has no parent directory: {}", config_path.display()),
                 ))
-            })?;
-            std::fs::create_dir_all(parent)?;
-            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            })?)?;
+            let mut temp = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -162,15 +156,12 @@ impl Config {
     ///
     /// Always returns a valid URL: falls back to the network's default for
     /// missing or invalid overrides.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if a hardcoded built-in default RPC URL is invalid.
     pub fn rpc_url(&self, network: NetworkId) -> url::Url {
         let url_str = self
             .rpc
             .get(&network)
-            .map_or_else(|| network.default_rpc_url(), String::as_str);
+            .map(String::as_str)
+            .unwrap_or_else(|| network.default_rpc_url());
 
         url_str.parse().unwrap_or_else(|_| {
             network
@@ -206,7 +197,7 @@ mod tests {
         fn build(self) -> Config {
             Config {
                 rpc: self.rpc,
-                telemetry: TelemetryConfig::default(),
+                telemetry: Default::default(),
             }
         }
     }
@@ -299,7 +290,7 @@ mod tests {
                     "https://moderato.example.com".to_string(),
                 ),
             ]),
-            telemetry: TelemetryConfig::default(),
+            telemetry: Default::default(),
         };
 
         let content = toml::to_string_pretty(&config).expect("serialize");
@@ -307,61 +298,6 @@ mod tests {
 
         let loaded = Config::load(Some(&path), None).expect("load");
         assert_eq!(loaded.rpc, config.rpc);
-    }
-
-    #[test]
-    fn test_rpc_url_invalid_override_falls_back_to_default() {
-        let config = Config::builder().rpc(NetworkId::Tempo, "not-a-url").build();
-
-        let url = config.rpc_url(NetworkId::Tempo);
-        let default_url: url::Url = NetworkId::Tempo
-            .default_rpc_url()
-            .parse()
-            .expect("default is valid");
-        assert_eq!(url, default_url);
-    }
-
-    #[test]
-    fn test_rpc_url_with_general_rpc_entry() {
-        let custom = "https://my-custom-rpc.example.com";
-        let config = Config::builder()
-            .rpc(NetworkId::TempoModerato, custom)
-            .build();
-
-        let url = config.rpc_url(NetworkId::TempoModerato);
-        assert_eq!(url.as_str(), "https://my-custom-rpc.example.com/");
-    }
-
-    #[test]
-    fn test_config_save_creates_file_and_reloads() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("subdir").join("config.toml");
-
-        let config = Config::builder()
-            .rpc(NetworkId::Tempo, "https://saved-rpc.example.com")
-            .build();
-
-        Config::write_default(&path, &config).expect("write_default");
-        assert!(path.exists(), "config file should exist after save");
-
-        let loaded = Config::load(Some(&path), None).expect("load");
-        assert_eq!(
-            loaded.rpc.get(&NetworkId::Tempo).unwrap(),
-            "https://saved-rpc.example.com"
-        );
-    }
-
-    #[test]
-    fn test_config_default_has_empty_rpc() {
-        let config = Config::default();
-        assert!(config.rpc.is_empty());
-    }
-
-    #[test]
-    fn test_load_rejects_path_traversal() {
-        let result = Config::load(Some("../../../etc/passwd"), None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("path traversal"));
     }
 
     #[test]

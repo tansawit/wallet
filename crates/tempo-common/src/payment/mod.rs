@@ -1,6 +1,9 @@
-//! Payment handling: shared types, error classification, and session management.
+//! Payment handling: charge (one-shot) and session (channel) flows.
+//!
+//! Routes HTTP 402 responses to the appropriate payment path,
+//! builds and signs transactions, and retries with payment credentials.
 
-pub mod classify;
+mod charge;
+pub mod dispatch;
+pub mod error;
 pub mod session;
-
-pub use classify::*;

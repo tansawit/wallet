@@ -1,47 +1,33 @@
-//! Opt-out telemetry via `PostHog`.
+//! Opt-out telemetry via PostHog.
 
-use std::{
-    io::Write,
-    sync::{Arc, Mutex},
-};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use posthog_rs::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-use crate::{config::Config, keys::Keystore, network::NetworkId};
+use crate::config::Config;
+use crate::keys::Keystore;
+use crate::network::NetworkId;
 
 // ---------------------------------------------------------------------------
 // PostHog client
 // ---------------------------------------------------------------------------
 
-const POSTHOG_API_KEY_ENV: &str = "POSTHOG_API_KEY";
-const POSTHOG_API_KEY_COMPILED: Option<&str> = option_env!("POSTHOG_API_KEY");
+const POSTHOG_API_KEY: &str = "phc_aNlTw2xAUQKd9zTovXeYheEUpQpEhplehCK5r1e31HR";
 
-fn posthog_api_key() -> Option<String> {
-    std::env::var(POSTHOG_API_KEY_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| POSTHOG_API_KEY_COMPILED.map(ToString::to_string))
-}
-
-fn build_event(
-    event_name: &str,
-    distinct_id: &str,
-    app_id: &str,
-    session_id: &str,
-    properties: Value,
-) -> posthog_rs::Event {
+async fn ph_capture(client: &Client, distinct_id: &str, event_name: &str, properties: Value) {
     let mut event = posthog_rs::Event::new(event_name, distinct_id);
-    let _ = event.insert_prop("tempo_app_id", app_id);
-    let _ = event.insert_prop("$lib", app_id);
+    let _ = event.insert_prop("tempo_app_id", "tempo-wallet");
+    let _ = event.insert_prop("$lib", "tempo-wallet");
     let _ = event.insert_prop("$lib_version", env!("CARGO_PKG_VERSION"));
     let _ = event.insert_prop("os", std::env::consts::OS);
     let _ = event.insert_prop("arch", std::env::consts::ARCH);
-    let _ = event.insert_prop("$session_id", session_id);
 
     if let Value::Object(map) = properties {
         for (k, v) in map {
@@ -49,27 +35,23 @@ fn build_event(
         }
     }
 
-    event
+    let _ = client.capture(event).await;
 }
 
-fn build_alias_event(app_id: &str, previous_id: &str, new_id: &str) -> posthog_rs::Event {
+async fn ph_alias(client: &Client, previous_id: &str, new_id: &str) {
     let mut event = posthog_rs::Event::new("$create_alias", new_id);
     let _ = event.insert_prop("alias", previous_id);
-    let _ = event.insert_prop("tempo_app_id", app_id);
-    event
+    let _ = event.insert_prop("tempo_app_id", "tempo-wallet");
+
+    let _ = client.capture(event).await;
 }
 
-fn build_identify_event(
-    app_id: &str,
-    distinct_id: &str,
-    set_props: Value,
-    set_once_props: Value,
-) -> posthog_rs::Event {
+async fn ph_identify(client: &Client, distinct_id: &str, properties: Value) {
     let mut event = posthog_rs::Event::new("$identify", distinct_id);
-    let _ = event.insert_prop("tempo_app_id", app_id);
-    let _ = event.insert_prop("$set", set_props);
-    let _ = event.insert_prop("$set_once", set_once_props);
-    event
+    let _ = event.insert_prop("tempo_app_id", "tempo-wallet");
+    let _ = event.insert_prop("$set", properties);
+
+    let _ = client.capture(event).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,78 +68,56 @@ fn is_telemetry_disabled(config: &Config) -> bool {
 
 /// Generate a stable anonymous ID unique to the OS user on this machine.
 ///
-/// Uses SHA-256 for a deterministic hash that is stable across Rust compiler
-/// versions (unlike `DefaultHasher`).
+/// Note: `DefaultHasher` output is not guaranteed stable across Rust versions,
+/// so anonymous IDs may change on compiler upgrades. This is acceptable for
+/// analytics — the user will simply appear as a new anonymous user.
 fn anonymous_id() -> String {
-    let mut hasher = Sha256::new();
-    let has_host_input = hostname::get().is_ok_and(|name| {
-        hasher.update(name.as_encoded_bytes());
-        true
-    });
+    let mut hasher = DefaultHasher::new();
+    let mut has_input = false;
+    if let Ok(name) = hostname::get() {
+        name.hash(&mut hasher);
+        has_input = true;
+    }
     // Include the OS username so different users on the same host get distinct IDs
-    let has_user_input = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .is_ok_and(|user| {
-            hasher.update(user.as_bytes());
-            true
-        });
-    let has_input = has_host_input || has_user_input;
+    if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME")) {
+        user.hash(&mut hasher);
+        has_input = true;
+    }
     // Fallback: use the config directory path as a stable per-user identifier
     // (avoids all container users collapsing to the same anonymous ID)
     if !has_input {
         if let Some(dir) = dirs::config_dir() {
-            hasher.update(dir.to_string_lossy().as_bytes());
+            dir.hash(&mut hasher);
         }
     }
-    let hash = hasher.finalize();
-    format!("anon-{}", hex::encode(&hash[..16]))
-}
-
-/// Generate a per-invocation session ID (UUIDv4-like from random bytes).
-fn generate_session_id() -> String {
-    let mut bytes = [0u8; 16];
-    // Best-effort: fall back to zeros if randomness is unavailable
-    let _ = getrandom::getrandom(&mut bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex::encode(&bytes[0..4]),
-        hex::encode(&bytes[4..6]),
-        hex::encode(&bytes[6..8]),
-        hex::encode(&bytes[8..10]),
-        hex::encode(&bytes[10..16]),
-    )
+    format!("anon-{:016x}", hasher.finish())
 }
 
 #[derive(Clone)]
 pub struct Analytics {
     client: Arc<Client>,
     distinct_id: String,
-    app_id: &'static str,
-    session_id: String,
     network: String,
-    pending: Arc<Mutex<Vec<posthog_rs::Event>>>,
+    pending: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Analytics {
-    pub async fn new(
-        network: NetworkId,
-        config: &Config,
-        keys: &Keystore,
-        app_id: &'static str,
-    ) -> Option<Self> {
+    pub async fn new(network: NetworkId, config: &Config, keys: &Keystore) -> Option<Self> {
         if is_telemetry_disabled(config) {
             return None;
         }
 
-        let api_key = posthog_api_key()?;
-        let client = posthog_rs::client(api_key.as_str()).await;
-        let distinct_id = keys.wallet_address_hex().unwrap_or_else(anonymous_id);
+        let client = posthog_rs::client(POSTHOG_API_KEY).await;
+        let addr = keys.wallet_address();
+        let distinct_id = if addr.is_empty() {
+            anonymous_id()
+        } else {
+            addr.to_string()
+        };
 
         let analytics = Self {
             client: Arc::new(client),
             distinct_id,
-            app_id,
-            session_id: generate_session_id(),
             network: network.to_string(),
             pending: Arc::new(Mutex::new(Vec::new())),
         };
@@ -170,82 +130,67 @@ impl Analytics {
     }
 
     pub fn track<P: EventPayload>(&self, event: Event, payload: P) {
-        let event_name = event.as_str();
+        let client = self.client.clone();
+        let distinct_id = self.distinct_id.clone();
+        let event_name = event.as_str().to_string();
+        let network = self.network.clone();
 
         let mut props = serde_json::to_value(&payload).unwrap_or_default();
         if let Value::Object(ref mut map) = props {
-            map.entry("network".to_string())
-                .or_insert(json!(self.network));
+            map.entry("network".to_string()).or_insert(json!(network));
         }
 
         // Test hook: if TEMPO_TEST_EVENTS is set, append events to the file for assertions
-        test_tap_event(event_name, &props);
+        test_tap_event(&event_name, &props);
 
-        let event = build_event(
-            event_name,
-            &self.distinct_id,
-            self.app_id,
-            &self.session_id,
-            props,
-        );
-
+        let handle = tokio::spawn(async move {
+            ph_capture(&client, &distinct_id, &event_name, props).await;
+        });
         if let Ok(mut pending) = self.pending.lock() {
-            pending.push(event);
+            pending.push(handle);
         }
     }
 
     pub fn identify(&self, keys: &Keystore) {
-        let Some(wallet) = keys.wallet_address_hex() else {
+        let addr = keys.wallet_address();
+        if addr.is_empty() {
             return;
-        };
-
-        if self.distinct_id != wallet {
-            let alias_event = build_alias_event(self.app_id, &wallet, &self.distinct_id);
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.push(alias_event);
-            }
         }
+        let wallet = addr.to_string();
 
-        let identify_event = build_identify_event(
-            self.app_id,
-            &wallet,
-            json!({
-                "wallet_address": &wallet,
-                "cli_version": env!("CARGO_PKG_VERSION"),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "network": &self.network,
-            }),
-            json!({
-                "first_cli_version": env!("CARGO_PKG_VERSION"),
-                "first_seen_at": OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
-            }),
-        );
+        let client = self.client.clone();
+        let old_id = self.distinct_id.clone();
+        let network = self.network.clone();
+
+        let handle = tokio::spawn(async move {
+            if old_id != wallet {
+                ph_alias(&client, &old_id, &wallet).await;
+            }
+            ph_identify(
+                &client,
+                &wallet,
+                json!({
+                    "wallet_address": &wallet,
+                    "cli_version": env!("CARGO_PKG_VERSION"),
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "network": network,
+                }),
+            )
+            .await;
+        });
         if let Ok(mut pending) = self.pending.lock() {
-            pending.push(identify_event);
+            pending.push(handle);
         }
     }
 
     pub async fn flush(&self) {
-        let events = {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handles = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *pending)
         };
 
-        if events.is_empty() {
-            return;
-        }
-
-        let client = self.client.clone();
-        let _ = timeout(Duration::from_secs(2), async move {
-            let _ = client.capture_batch(events, false).await;
-        })
-        .await;
+        let _ = timeout(Duration::from_secs(2), futures::future::join_all(handles)).await;
     }
 }
 
@@ -254,7 +199,7 @@ fn test_tap_event(name: &str, props: &Value) {
         if path.is_empty() {
             return;
         }
-        let line = format!("{name}|{props}\n");
+        let line = format!("{}|{}\n", name, props);
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -269,75 +214,187 @@ fn test_tap_event(name: &str, props: &Value) {
 // Events and payloads
 // ---------------------------------------------------------------------------
 
-/// Analytics event identifier.
-///
-/// A thin wrapper around a static string. Each crate defines its own
-/// domain-specific event constants; shared lifecycle events live in
-/// the [`events`] module below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Event(&'static str);
+pub enum Event {
+    LoginStarted,
+    LoginSuccess,
+    LoginFailure,
+    LoginTimeout,
+    Logout,
+
+    QueryStarted,
+    QuerySuccess,
+    QueryFailure,
+
+    PaymentStarted,
+    PaymentSuccess,
+    PaymentFailure,
+
+    KeyCreated,
+    WhoamiViewed,
+
+    CallbackWindowOpened,
+    CallbackReceived,
+
+    WalletCreated,
+
+    WalletFundStarted,
+    WalletFundSuccess,
+    WalletFundFailure,
+
+    SessionRecovered,
+
+    CommandRun,
+    CommandSuccess,
+    CommandFailure,
+    CoopCloseSuccess,
+    CoopCloseFailure,
+}
 
 impl Event {
-    #[must_use]
-    pub const fn new(name: &'static str) -> Self {
-        Self(name)
-    }
-
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        self.0
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LoginStarted => "login_started",
+            Self::LoginSuccess => "login_success",
+            Self::LoginFailure => "login_failure",
+            Self::LoginTimeout => "login_timeout",
+            Self::Logout => "logout",
+            Self::QueryStarted => "query_started",
+            Self::QuerySuccess => "query_success",
+            Self::QueryFailure => "query_failure",
+            Self::PaymentStarted => "payment_started",
+            Self::PaymentSuccess => "payment_success",
+            Self::PaymentFailure => "payment_failure",
+            Self::KeyCreated => "key_created",
+            Self::WhoamiViewed => "whoami_viewed",
+            Self::CallbackWindowOpened => "callback_window_opened",
+            Self::CallbackReceived => "callback_received",
+            Self::WalletCreated => "wallet_created",
+            Self::WalletFundStarted => "wallet_fund_started",
+            Self::WalletFundSuccess => "wallet_fund_success",
+            Self::WalletFundFailure => "wallet_fund_failure",
+            Self::SessionRecovered => "session_recovered",
+            Self::CommandRun => "command_run",
+            Self::CommandSuccess => "command_success",
+            Self::CommandFailure => "command_failure",
+            Self::CoopCloseSuccess => "coop_close_success",
+            Self::CoopCloseFailure => "coop_close_failure",
+        }
     }
 }
 
-/// Shared lifecycle events used by CLI runner infrastructure.
-pub mod events {
-    use super::Event;
-
-    pub const COMMAND_SUCCESS: Event = Event::new("command succeeded");
-    pub const COMMAND_FAILURE: Event = Event::new("command failed");
-    pub const COOP_CLOSE_SUCCESS: Event = Event::new("coop close succeeded");
-    pub const COOP_CLOSE_FAILURE: Event = Event::new("coop close failed");
-    pub const SESSION_STORE_DEGRADED: Event = Event::new("session store degraded");
-    pub const KEYSTORE_LOAD_DEGRADED: Event = Event::new("keystore load degraded");
-}
-
-/// Marker trait for analytics event payloads.
+/// Trait for analytics event payloads.
 ///
-/// Automatically implemented for any type that is `Serialize + Send + Sync + 'static`.
+/// The `'static` bound is required because payloads are moved into `tokio::spawn` tasks.
 pub trait EventPayload: Serialize + Send + Sync + 'static {}
-impl<T: Serialize + Send + Sync + 'static> EventPayload for T {}
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct EmptyPayload;
+pub struct EmptyPayload;
+impl EventPayload for EmptyPayload {}
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CommandSuccessPayload {
-    pub command: String,
-    pub duration_ms: u128,
+pub struct LoginFailurePayload {
+    pub error: String,
 }
+impl EventPayload for LoginFailurePayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryStartedPayload {
+    pub url: String,
+    pub method: String,
+}
+impl EventPayload for QueryStartedPayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuerySuccessPayload {
+    pub url: String,
+    pub method: String,
+    pub status_code: u16,
+}
+impl EventPayload for QuerySuccessPayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryFailurePayload {
+    pub url: String,
+    pub method: String,
+    pub error: String,
+}
+impl EventPayload for QueryFailurePayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentStartedPayload {
+    pub network: String,
+    pub amount: String,
+    pub currency: String,
+    pub intent: String,
+}
+impl EventPayload for PaymentStartedPayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentSuccessPayload {
+    pub network: String,
+    pub amount: String,
+    pub currency: String,
+    pub tx_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub intent: String,
+}
+impl EventPayload for PaymentSuccessPayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentFailurePayload {
+    pub network: String,
+    pub amount: String,
+    pub currency: String,
+    pub error: String,
+    pub intent: String,
+}
+impl EventPayload for PaymentFailurePayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandRunPayload {
+    pub command: String,
+}
+impl EventPayload for CommandRunPayload {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandFailurePayload {
     pub command: String,
     pub error: String,
-    pub duration_ms: u128,
 }
+impl EventPayload for CommandFailurePayload {}
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct CoopClosePayload {
-    pub(crate) network: String,
-    pub(crate) channel_id: String,
+pub struct CallbackReceivedPayload {
+    pub duration_secs: u64,
 }
+impl EventPayload for CallbackReceivedPayload {}
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct SessionStoreDegradedPayload {
-    pub(crate) malformed_load_drops: u64,
-    pub(crate) malformed_list_drops: u64,
+pub struct WalletCreatedPayload {
+    pub wallet_type: String,
 }
+impl EventPayload for WalletCreatedPayload {}
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct KeystoreLoadDegradedPayload {
-    pub(crate) strict_parse_failures: u64,
-    pub(crate) salvage_malformed_entries: u64,
-    pub(crate) filtered_invalid_entries: u64,
+pub struct WalletFundPayload {
+    pub network: String,
+    pub method: String,
 }
+impl EventPayload for WalletFundPayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WalletFundFailurePayload {
+    pub network: String,
+    pub method: String,
+    pub error: String,
+}
+impl EventPayload for WalletFundFailurePayload {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoopClosePayload {
+    pub network: String,
+    pub channel_id: String,
+}
+impl EventPayload for CoopClosePayload {}
