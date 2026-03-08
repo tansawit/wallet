@@ -2,7 +2,7 @@
 name = "tempo-mpp"
 version = "0.1.0"
 edition = "2021"
-description = "MPP query/session/services extension"
+description = "MPP session and service operations"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tempoxyz/wallet"
 readme = "../../README.md"
