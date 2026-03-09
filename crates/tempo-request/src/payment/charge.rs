@@ -3,29 +3,15 @@
 //! This module handles the MPP protocol (<https://mpp.dev>) which uses
 //! WWW-Authenticate and Authorization headers for HTTP-native payments.
 
+use anyhow::{Context, Result};
 use mpp::client::PaymentProvider;
 
 use crate::http::{HttpClient, HttpResponse};
-use tempo_common::{
-    cli::terminal::sanitize_for_terminal,
-    error::{ConfigError, KeyError, PaymentError, TempoError},
-    keys::Signer,
-};
+use tempo_common::error::{ConfigError, PaymentError};
+use tempo_common::keys::Signer;
 
-use super::{
-    lock::{acquire_origin_lock, origin_lock_key},
-    types::{PaymentResult, ResolvedChallenge},
-};
-use tempo_common::payment::{classify_payment_error, map_mpp_validation_error};
-
-/// Whether a post-submission HTTP status code warrants a provisioning retry.
-///
-/// Only auth/payment codes (401–403) and server errors (5xx) are retried.
-/// Other 4xx codes (400 body validation, 404, 422, 429, etc.) are not
-/// payment-related and retrying with key_authorization would be wasteful.
-const fn is_retriable_payment_status(status: u16) -> bool {
-    matches!(status, 401..=403 | 500..=599)
-}
+use super::router::{PaymentResult, ResolvedChallenge};
+use tempo_common::payment::error::{classify_payment_error, map_mpp_validation_error};
 
 /// Handle an MPP charge payment flow (402 with intent="charge").
 ///
@@ -36,167 +22,83 @@ pub(super) async fn handle_charge_request(
     url: &str,
     resolved: ResolvedChallenge,
     signer: Signer,
-) -> Result<PaymentResult, TempoError> {
+) -> Result<PaymentResult> {
     let challenge = &resolved.challenge;
 
     challenge
         .validate_for_charge("tempo")
         .map_err(|e| map_mpp_validation_error(e, challenge))?;
 
+    let provider =
+        mpp::client::TempoProvider::new(signer.signer.clone(), resolved.rpc_url.as_str())
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?
+            .with_signing_mode(signer.signing_mode);
+
+    let credential = provider
+        .pay(challenge)
+        .await
+        .map_err(|e| classify_payment_error(e, &resolved.network_id))?;
+
+    let auth_header =
+        mpp::format_authorization(&credential).context("Failed to format Authorization header")?;
+
     if http.dry_run {
         eprintln!("[DRY RUN] Signed transaction ready, skipping submission.");
         return Ok(PaymentResult {
-            tx_hash: None,
-            channel_id: None,
+            tx_hash: String::new(),
+            session_id: None,
             status_code: 200,
             response: None,
         });
     }
 
-    // Serialize charge submissions per origin before building/submitting payment
-    // credentials to avoid duplicate expiring-nonce tx races under overlap.
-    let lock_key = origin_lock_key(url);
-    let _charge_lock = acquire_origin_lock(&lock_key)?;
+    if http.log_enabled() {
+        eprintln!("Submitting payment...");
+    }
 
-    let provider =
-        mpp::client::TempoProvider::new(signer.signer.clone(), resolved.rpc_url.as_str())
-            .map_err(|source| ConfigError::ProviderInitSource {
-                provider: "tempo payment provider",
-                source: Box::new(source),
-            })?
-            .with_signing_mode(signer.signing_mode.clone());
-
-    let credential = match provider.pay(challenge).await {
-        Ok(cred) => cred,
-        Err(original) if signer.has_stored_key_authorization() => {
-            if http.log_enabled() {
-                eprintln!("Key not provisioned on-chain, retrying with authorization...");
-            }
-            let provisioning_signer =
-                signer
-                    .with_key_authorization()
-                    .ok_or_else(|| KeyError::SigningOperation {
-                        operation: "key provisioning",
-                        reason: "stored key authorization could not be applied to signing mode"
-                            .to_string(),
-                    })?;
-            let retry_provider = mpp::client::TempoProvider::new(
-                provisioning_signer.signer.clone(),
-                resolved.rpc_url.as_str(),
-            )
-            .map_err(|source| ConfigError::ProviderInitSource {
-                provider: "tempo payment provider (provisioning retry)",
-                source: Box::new(source),
-            })?
-            .with_signing_mode(provisioning_signer.signing_mode);
-            retry_provider
-                .pay(challenge)
-                .await
-                .map_err(|_| classify_payment_error(original, &resolved.network_id))?
-        }
-        Err(e) => return Err(classify_payment_error(e, &resolved.network_id)),
-    };
-
-    let resp = submit_credential(http, url, &credential).await?;
-
-    // If the server rejects the payment and we have a stored key authorization,
-    // retry with provisioning. The server validates the transaction on-chain, and
-    // it may fail when the access key isn't provisioned even though signing
-    // succeeded locally (the optimistic path omits key_authorization).
-    let resp =
-        if is_retriable_payment_status(resp.status_code) && signer.has_stored_key_authorization() {
-            if http.log_enabled() {
-                eprintln!(
-                    "Server rejected payment (HTTP {}), retrying with key authorization...",
-                    resp.status_code
-                );
-                if let Ok(body) = resp.body_string() {
-                    eprintln!("Rejection body: {}", sanitize_for_terminal(&body));
-                }
-            }
-            let provisioning_signer =
-                signer
-                    .with_key_authorization()
-                    .ok_or_else(|| KeyError::SigningOperation {
-                        operation: "key provisioning",
-                        reason: "stored key authorization could not be applied to signing mode"
-                            .to_string(),
-                    })?;
-            let retry_provider = mpp::client::TempoProvider::new(
-                provisioning_signer.signer.clone(),
-                resolved.rpc_url.as_str(),
-            )
-            .map_err(|source| ConfigError::ProviderInitSource {
-                provider: "tempo payment provider (provisioning retry)",
-                source: Box::new(source),
-            })?
-            .with_signing_mode(provisioning_signer.signing_mode);
-            let original_resp_rejection = parse_payment_rejection(&resp);
-            let retry_credential = retry_provider
-                .pay(challenge)
-                .await
-                .map_err(|_| original_resp_rejection)?;
-            submit_credential(http, url, &retry_credential).await?
-        } else {
-            resp
-        };
+    let headers = vec![("Authorization".to_string(), auth_header)];
+    let resp = http.execute(url, &headers).await?;
 
     if resp.status_code >= 400 {
         return Err(parse_payment_rejection(&resp).into());
     }
 
-    let tx_hash = match resp.header("payment-receipt") {
-        Some(header) => {
-            if let Err(source) = mpp::parse_receipt(header) {
-                eprintln!(
-                    "Warning: ignoring invalid Payment-Receipt on paid charge response: {source}"
-                );
-            }
-            mpp::protocol::core::extract_tx_hash(header)
-                .or_else(|| mpp::parse_receipt(header).ok().map(|r| r.reference))
-        }
-        None => {
-            eprintln!("Warning: missing Payment-Receipt on successful paid charge response");
-            None
-        }
-    };
+    if http.log_enabled() {
+        eprintln!("Payment accepted: HTTP {}", resp.status_code);
+    }
+
+    let tx_hash = resp
+        .header("payment-receipt")
+        .and_then(|h| {
+            mpp::protocol::core::extract_tx_hash(h)
+                .or_else(|| mpp::parse_receipt(h).ok().map(|r| r.reference))
+        })
+        .unwrap_or_default();
 
     Ok(PaymentResult {
         tx_hash,
-        channel_id: None,
+        session_id: None,
         status_code: resp.status_code,
         response: Some(resp),
     })
 }
 
-/// Format the credential as an Authorization header and submit to the server.
-async fn submit_credential(
-    http: &HttpClient,
-    url: &str,
-    credential: &mpp::protocol::core::PaymentCredential,
-) -> Result<HttpResponse, TempoError> {
-    let auth_header = mpp::format_authorization(credential).map_err(|source| {
-        PaymentError::ChallengeFormatSource {
-            context: "Authorization header",
-            source: Box::new(source),
-        }
-    })?;
-    let headers = vec![("Authorization".to_string(), auth_header)];
-    http.execute(url, &headers).await
-}
-
-/// Maximum characters to include in a payment rejection reason.
-const MAX_REJECTION_REASON_CHARS: usize = 500;
-
 /// Parse a non-200 response after payment submission into a descriptive error.
 fn parse_payment_rejection(response: &HttpResponse) -> PaymentError {
-    let raw_reason = match response.body_string() {
-        Ok(body) if !body.trim().is_empty() => {
-            body.chars().take(MAX_REJECTION_REASON_CHARS).collect()
+    let reason = if let Ok(body) = response.body_string() {
+        if let Some(msg) = tempo_common::payment::error::extract_json_error(&body) {
+            msg
+        } else if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+            // Valid JSON but no known error field
+            format!("HTTP {}", response.status_code)
+        } else if !body.trim().is_empty() {
+            body.chars().take(200).collect()
+        } else {
+            format!("HTTP {}", response.status_code)
         }
-        _ => format!("HTTP {}", response.status_code),
+    } else {
+        format!("HTTP {}", response.status_code)
     };
-    let reason = sanitize_for_terminal(&raw_reason);
 
     PaymentError::PaymentRejected {
         reason,
@@ -209,8 +111,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_payment_rejection_returns_full_json_body() {
-        let body = br#"{"error":"insufficient funds","details":"need 0.05 USDC"}"#;
+    fn test_parse_payment_rejection_json_error_field() {
+        let body = br#"{"error":"insufficient funds"}"#;
         let resp = HttpResponse::for_test(400, body);
         let err = parse_payment_rejection(&resp);
         match err {
@@ -218,9 +120,64 @@ mod tests {
                 reason,
                 status_code,
             } => {
-                assert!(reason.contains("insufficient funds"));
-                assert!(reason.contains("need 0.05 USDC"));
+                assert_eq!(reason, "insufficient funds");
                 assert_eq!(status_code, 400);
+            }
+            _ => panic!("expected PaymentRejected"),
+        }
+    }
+
+    #[test]
+    fn test_parse_payment_rejection_json_message_field() {
+        let body = br#"{"message":"bad request"}"#;
+        let resp = HttpResponse::for_test(400, body);
+        let err = parse_payment_rejection(&resp);
+        match err {
+            PaymentError::PaymentRejected { reason, .. } => {
+                assert_eq!(reason, "bad request");
+            }
+            _ => panic!("expected PaymentRejected"),
+        }
+    }
+
+    #[test]
+    fn test_parse_payment_rejection_json_detail_field() {
+        let body = br#"{"detail":"validation failed"}"#;
+        let resp = HttpResponse::for_test(422, body);
+        let err = parse_payment_rejection(&resp);
+        match err {
+            PaymentError::PaymentRejected {
+                reason,
+                status_code,
+            } => {
+                assert_eq!(reason, "validation failed");
+                assert_eq!(status_code, 422);
+            }
+            _ => panic!("expected PaymentRejected"),
+        }
+    }
+
+    #[test]
+    fn test_parse_payment_rejection_json_no_known_field() {
+        let body = br#"{"foo":"bar"}"#;
+        let resp = HttpResponse::for_test(500, body);
+        let err = parse_payment_rejection(&resp);
+        match err {
+            PaymentError::PaymentRejected { reason, .. } => {
+                assert_eq!(reason, "HTTP 500");
+            }
+            _ => panic!("expected PaymentRejected"),
+        }
+    }
+
+    #[test]
+    fn test_parse_payment_rejection_json_error_precedence() {
+        let body = br#"{"error":"e","message":"m","detail":"d"}"#;
+        let resp = HttpResponse::for_test(400, body);
+        let err = parse_payment_rejection(&resp);
+        match err {
+            PaymentError::PaymentRejected { reason, .. } => {
+                assert_eq!(reason, "e");
             }
             _ => panic!("expected PaymentRejected"),
         }
@@ -240,13 +197,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_payment_rejection_truncated() {
-        let body = "a".repeat(600);
+    fn test_parse_payment_rejection_plain_text_truncated() {
+        let body = "a".repeat(500);
         let resp = HttpResponse::for_test(500, body.as_bytes());
         let err = parse_payment_rejection(&resp);
         match err {
             PaymentError::PaymentRejected { reason, .. } => {
-                assert_eq!(reason.len(), MAX_REJECTION_REASON_CHARS);
+                assert_eq!(reason.len(), 200);
             }
             _ => panic!("expected PaymentRejected"),
         }

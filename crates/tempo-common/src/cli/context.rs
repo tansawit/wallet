@@ -1,13 +1,12 @@
 //! Shared base context for extension CLIs.
 
+use anyhow::Result;
+
 use super::verbosity::Verbosity;
-use crate::{
-    analytics::{Analytics, Event, EventPayload},
-    config::Config,
-    error::TempoError,
-    keys::Keystore,
-    network::NetworkId,
-};
+use crate::analytics::{Analytics, Event, EventPayload};
+use crate::config::Config;
+use crate::keys::Keystore;
+use crate::network::NetworkId;
 
 use super::output::OutputFormat;
 
@@ -19,7 +18,6 @@ pub(crate) struct ContextArgs {
     pub(crate) private_key: Option<String>,
     pub(crate) output_format: OutputFormat,
     pub(crate) verbosity: Verbosity,
-    pub(crate) app_id: &'static str,
 }
 
 /// Shared runtime context used by extension command handlers.
@@ -48,8 +46,15 @@ impl Context {
         }
     }
 
+    /// Flush pending analytics events (with timeout).
+    pub async fn flush_analytics(&self) {
+        if let Some(ref a) = self.analytics {
+            a.flush().await;
+        }
+    }
+
     /// Build the shared runtime context from parsed CLI arguments.
-    pub(crate) async fn build(args: ContextArgs) -> Result<Self, TempoError> {
+    pub(crate) async fn build(args: ContextArgs) -> Result<Self> {
         let config = Config::load(args.config_path.as_ref(), args.rpc_url.as_deref())?;
         let requested_network = args
             .requested_network
@@ -58,7 +63,7 @@ impl Context {
             .transpose()?;
         let network = NetworkId::resolve(args.requested_network.as_deref())?;
         let keys = Keystore::load(args.private_key.as_deref())?;
-        let analytics = Analytics::new(network, &config, &keys, args.app_id).await;
+        let analytics = Analytics::new(network, &config, &keys).await;
 
         Ok(Self {
             config,

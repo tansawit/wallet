@@ -1,63 +1,46 @@
 //! Session persistence helper for request-time session flows.
 
-use alloy::primitives::B256;
+use anyhow::{Context, Result};
 
-use tempo_common::error::{PaymentError, TempoError};
+use tempo_common::payment::session::store::{self, SessionRecord, SessionStatus};
 
-use tempo_common::session::{
-    load_channel, now_secs, save_channel, update_channel_cumulative_floor, ChannelRecord,
-    ChannelStatus,
-};
-
-use super::{ChannelContext, ChannelState};
+use super::{SessionContext, SessionState};
 
 /// Persist or update the session record to disk.
-pub(super) fn persist_session(
-    ctx: &ChannelContext<'_>,
-    state: &ChannelState,
-) -> Result<(), TempoError> {
-    let now = now_secs();
+pub(super) fn persist_session(ctx: &SessionContext<'_>, state: &SessionState) -> Result<()> {
+    let now = store::now_secs();
 
-    let echo_json = serde_json::to_string(ctx.echo).map_err(|source| {
-        PaymentError::ChannelPersistenceSource {
-            operation: "serialize challenge echo",
-            source: Box::new(source),
-        }
-    })?;
+    let echo_json =
+        serde_json::to_string(ctx.echo).context("Failed to serialize challenge echo")?;
 
-    let existing = load_channel(&format!("{:#x}", state.channel_id)).map_err(|source| {
-        PaymentError::ChannelPersistenceSource {
-            operation: "load channel",
-            source: Box::new(source),
-        }
-    })?;
+    let session_key = store::session_key(ctx.url);
+    let existing = store::load_session(&session_key)?;
 
     let record = if let Some(mut rec) = existing {
         // Update existing record
         rec.set_cumulative_amount(state.cumulative_amount);
-        rec.set_accepted_cumulative(state.accepted_cumulative);
-        rec.deposit = state.deposit;
         rec.challenge_echo = echo_json;
         rec.touch();
         rec
     } else {
-        ChannelRecord {
+        SessionRecord {
             version: 1,
             origin: ctx.origin.to_string(),
             request_url: ctx.url.to_string(),
+            network_name: ctx.network_id.as_str().to_string(),
             chain_id: state.chain_id,
-            escrow_contract: state.escrow_contract,
-            token: format!("{:#x}", ctx.token),
-            payee: format!("{:#x}", ctx.payee),
-            payer: format!("{:#x}", ctx.payer),
-            authorized_signer: ctx.signer.signer.address(),
+            escrow_contract: format!("{:#x}", state.escrow_contract),
+            currency: ctx.currency.clone(),
+            recipient: ctx.recipient.clone(),
+            payer: ctx.did.to_string(),
+            authorized_signer: format!("{:#x}", ctx.signer.address()),
             salt: ctx.salt.clone(),
-            channel_id: state.channel_id,
-            deposit: state.deposit,
-            cumulative_amount: state.cumulative_amount,
-            accepted_cumulative: state.accepted_cumulative,
+            channel_id: format!("{:#x}", state.channel_id),
+            deposit: ctx.deposit.to_string(),
+            tick_cost: ctx.tick_cost.to_string(),
+            cumulative_amount: state.cumulative_amount.to_string(),
             challenge_echo: echo_json,
-            state: ChannelStatus::Active,
+            state: SessionStatus::Active,
             close_requested_at: 0,
             grace_ready_at: 0,
             created_at: now,
@@ -65,30 +48,15 @@ pub(super) fn persist_session(
         }
     };
 
-    save_channel(&record).map_err(|source| PaymentError::ChannelPersistenceSource {
-        operation: "save channel",
-        source: Box::new(source),
-    })?;
+    store::save_session(&record)?;
 
     if ctx.http.log_enabled() {
-        let cumulative_display =
-            tempo_common::cli::format::format_token_amount(state.cumulative_amount, ctx.network_id);
-        eprintln!("Channel persisted (cumulative: {cumulative_display})");
+        let cumulative_display = tempo_common::display::format::format_token_amount(
+            state.cumulative_amount,
+            ctx.network_id,
+        );
+        eprintln!("Session persisted (cumulative: {cumulative_display})");
     }
 
-    Ok(())
-}
-
-pub(super) fn persist_channel_cumulative_floor(
-    channel_id: B256,
-    accepted_cumulative: u128,
-) -> Result<(), TempoError> {
-    let channel_id_hex = format!("{channel_id:#x}");
-    update_channel_cumulative_floor(&channel_id_hex, accepted_cumulative).map_err(|source| {
-        PaymentError::ChannelPersistenceSource {
-            operation: "update channel cumulative floor",
-            source: Box::new(source),
-        }
-    })?;
     Ok(())
 }

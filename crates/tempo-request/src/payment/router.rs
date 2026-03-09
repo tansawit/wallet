@@ -2,28 +2,39 @@
 //!
 //! This module is crate-internal and intentionally decoupled from CLI types.
 
+use anyhow::Result;
+
 use mpp::PaymentChallenge;
 
-use crate::http::HttpClient;
-use tempo_common::{
-    config::Config,
-    error::{PaymentError, TempoError},
-    keys::Keystore,
-    network::NetworkId,
-};
+use crate::http::{HttpClient, HttpResponse};
+use tempo_common::config::Config;
+use tempo_common::error::PaymentError;
+use tempo_common::keys::Keystore;
+use tempo_common::network::NetworkId;
 
-use super::{
-    charge::handle_charge_request,
-    session::handle_session_request,
-    types::{PaymentResult, ResolvedChallenge},
-};
+use super::charge::handle_charge_request;
+use super::session::handle_session_request;
+
+/// Parsed challenge with resolved network, shared by charge and session flows.
+pub(crate) struct ResolvedChallenge {
+    pub(crate) challenge: PaymentChallenge,
+    pub(crate) network_id: NetworkId,
+    pub(crate) rpc_url: url::Url,
+}
+
+/// Result of a successful payment dispatch.
+pub(crate) struct PaymentResult {
+    pub(crate) tx_hash: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) status_code: u16,
+    pub(crate) response: Option<HttpResponse>,
+}
 
 /// Dispatch to charge or session payment flow.
 ///
 /// `network` is the already-resolved network from the 402 challenge.
 /// The caller is responsible for parsing the challenge and extracting
-/// the network before calling this function (see `query/challenge.rs`).
-#[allow(clippy::too_many_arguments)]
+/// the network before calling this function (see `query/payment_challenge.rs`).
 pub(crate) async fn dispatch_payment(
     config: &Config,
     http: &HttpClient,
@@ -32,15 +43,13 @@ pub(crate) async fn dispatch_payment(
     challenge: PaymentChallenge,
     network: NetworkId,
     keys: &Keystore,
-) -> Result<PaymentResult, TempoError> {
+) -> Result<PaymentResult> {
     if let Some(allowed) = http.network {
         if allowed != network {
-            return Err(PaymentError::ChallengeSchema {
-                context: "payment challenge network",
-                reason: format!(
-                    "Server requested network '{network}' but --network is '{allowed}'"
-                ),
-            }
+            return Err(PaymentError::InvalidChallenge(format!(
+                "Server requested network '{}' but --network is '{}'",
+                network, allowed
+            ))
             .into());
         }
     }

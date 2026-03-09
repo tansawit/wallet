@@ -2,51 +2,21 @@
 
 use std::time::Duration;
 
+use anyhow::Result;
 use tracing::warn;
 
 use super::response::HttpResponse;
-use tempo_common::{
-    error::{ConfigError, NetworkError, TempoError},
-    network::NetworkId,
-};
-
-type HttpResult<T> = std::result::Result<T, TempoError>;
+use tempo_common::network::NetworkId;
 
 /// Default User-Agent header value for requests.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!("tempo/", env!("CARGO_PKG_VERSION"));
-
-/// A single field in a multipart form body.
-#[derive(Debug, Clone)]
-pub(crate) enum MultipartField {
-    Text {
-        name: String,
-        value: String,
-    },
-    File {
-        name: String,
-        filename: String,
-        content_type: Option<String>,
-        bytes: Vec<u8>,
-    },
-}
-
-/// Replayable HTTP request body.
-///
-/// Multipart bodies cannot use `reqwest::multipart::Form` directly because
-/// `Form` is not `Clone`. Instead we store the field specs and rebuild a
-/// fresh `Form` on every send (initial, retry, and payment replay).
-#[derive(Debug, Clone)]
-pub(crate) enum HttpRequestBody {
-    Bytes(Vec<u8>),
-    Multipart(Vec<MultipartField>),
-}
 
 /// Pre-resolved HTTP request plan, independent of CLI types.
 #[derive(Debug)]
 pub(crate) struct HttpRequestPlan {
     pub(crate) method: reqwest::Method,
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Option<HttpRequestBody>,
+    pub(crate) body: Option<Vec<u8>>,
     pub(crate) timeout_secs: Option<u64>,
     pub(crate) connect_timeout_secs: Option<u64>,
     pub(crate) follow_redirects: bool,
@@ -97,9 +67,9 @@ impl Default for HttpRequestPlan {
 /// Owns a pre-built reqwest client and the request plan. Built at the CLI
 /// boundary so that HTTP and payment modules never depend on CLI types.
 pub(crate) struct HttpClient {
-    plan: HttpRequestPlan,
+    pub(crate) plan: HttpRequestPlan,
     client: reqwest::Client,
-    pub(crate) verbosity: tempo_common::cli::Verbosity,
+    pub(crate) verbosity: tempo_common::util::Verbosity,
     pub(crate) network: Option<NetworkId>,
     pub(crate) dry_run: bool,
 }
@@ -112,10 +82,10 @@ impl HttpClient {
     /// Authorization) are added in [`execute()`](Self::execute).
     pub(crate) fn new(
         plan: HttpRequestPlan,
-        verbosity: tempo_common::cli::Verbosity,
+        verbosity: tempo_common::util::Verbosity,
         network: Option<NetworkId>,
         dry_run: bool,
-    ) -> HttpResult<Self> {
+    ) -> Result<Self> {
         let verbose_connection = verbosity.debug_enabled();
         let mut builder = reqwest::Client::builder().connection_verbose(verbose_connection);
 
@@ -143,8 +113,7 @@ impl HttpClient {
         if plan.no_proxy {
             builder = builder.no_proxy();
         } else if let Some(ref p) = plan.proxy {
-            let proxy =
-                reqwest::Proxy::all(p).map_err(|source| ConfigError::InvalidProxyUrl { source })?;
+            let proxy = reqwest::Proxy::all(p)?;
             builder = builder.proxy(proxy);
         }
 
@@ -167,7 +136,7 @@ impl HttpClient {
                 let header_value = match reqwest::header::HeaderValue::from_str(value) {
                     Ok(v) => v,
                     Err(e) => {
-                        let safe = tempo_common::security::redact_header_value(name, value);
+                        let safe = tempo_common::security::redact::redact_header_value(name, value);
                         warn!(header_name = %name, header_value = %safe, error = %e, "dropping header with invalid value");
                         continue;
                     }
@@ -177,7 +146,7 @@ impl HttpClient {
             builder = builder.default_headers(header_map);
         }
 
-        let client = builder.build().map_err(NetworkError::Reqwest)?;
+        let client = builder.build()?;
 
         Ok(Self {
             plan,
@@ -191,77 +160,8 @@ impl HttpClient {
     /// The underlying reqwest client.
     ///
     /// Used by session flows that need direct access to the reqwest client.
-    pub(crate) const fn client(&self) -> &reqwest::Client {
+    pub(crate) fn client(&self) -> &reqwest::Client {
         &self.client
-    }
-
-    /// The HTTP method from the request plan.
-    pub(crate) const fn method(&self) -> &reqwest::Method {
-        &self.plan.method
-    }
-
-    /// The request body from the request plan, if any.
-    pub(crate) fn body(&self) -> Option<&HttpRequestBody> {
-        self.plan.body.as_ref()
-    }
-
-    /// Build a reqwest `Form` from stored multipart field specs.
-    fn build_multipart_form(fields: &[MultipartField]) -> reqwest::multipart::Form {
-        let mut form = reqwest::multipart::Form::new();
-        for field in fields {
-            match field {
-                MultipartField::Text { name, value } => {
-                    form = form.text(name.clone(), value.clone());
-                }
-                MultipartField::File {
-                    name,
-                    filename,
-                    content_type,
-                    bytes,
-                } => {
-                    let part =
-                        reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.clone());
-                    let part = match content_type {
-                        Some(mime) => part.mime_str(mime).unwrap_or_else(|_| {
-                            reqwest::multipart::Part::bytes(bytes.clone())
-                                .file_name(filename.clone())
-                        }),
-                        None => part,
-                    };
-                    form = form.part(name.clone(), part);
-                }
-            }
-        }
-        form
-    }
-
-    /// Apply the request body to a request builder (standalone variant for callers
-    /// that hold a body reference rather than the full plan).
-    pub(crate) fn apply_body_from(
-        req: reqwest::RequestBuilder,
-        body: Option<&HttpRequestBody>,
-    ) -> reqwest::RequestBuilder {
-        match body {
-            Some(HttpRequestBody::Bytes(data)) => req.body(data.clone()),
-            Some(HttpRequestBody::Multipart(fields)) => {
-                req.multipart(Self::build_multipart_form(fields))
-            }
-            None => req,
-        }
-    }
-
-    /// Apply the request body to a request builder.
-    fn apply_body(
-        req: reqwest::RequestBuilder,
-        body: &Option<HttpRequestBody>,
-    ) -> reqwest::RequestBuilder {
-        match body {
-            Some(HttpRequestBody::Bytes(data)) => req.body(data.clone()),
-            Some(HttpRequestBody::Multipart(fields)) => {
-                req.multipart(Self::build_multipart_form(fields))
-            }
-            None => req,
-        }
     }
 
     /// Build a raw reqwest request from the plan for streaming use.
@@ -273,17 +173,19 @@ impl HttpClient {
         for (name, value) in &self.plan.headers {
             req = req.header(name.as_str(), value.as_str());
         }
-        req = Self::apply_body(req, &self.plan.body);
+        if let Some(ref body) = self.plan.body {
+            req = req.body(body.clone());
+        }
         req
     }
 
     /// Whether agent-level log messages should be printed (`-v`).
-    pub(crate) const fn log_enabled(&self) -> bool {
+    pub(crate) fn log_enabled(&self) -> bool {
         self.verbosity.log_enabled()
     }
 
     /// Whether debug-level log messages should be printed (`-vv`).
-    pub(crate) const fn debug_enabled(&self) -> bool {
+    pub(crate) fn debug_enabled(&self) -> bool {
         self.verbosity.debug_enabled()
     }
 
@@ -297,7 +199,7 @@ impl HttpClient {
         &self,
         url: &str,
         extra_headers: &[(String, String)],
-    ) -> HttpResult<HttpResponse> {
+    ) -> Result<HttpResponse> {
         let plan = &self.plan;
         let mut attempt: u32 = 0;
         let mut backoff = plan.base_backoff_ms;
@@ -308,8 +210,10 @@ impl HttpClient {
                 for (name, value) in extra_headers {
                     req = req.header(name.as_str(), value.as_str());
                 }
-                req = Self::apply_body(req, &plan.body);
-                let response = req.send().await.map_err(NetworkError::Reqwest)?;
+                if let Some(data) = plan.body.as_deref() {
+                    req = req.body(data.to_vec());
+                }
+                let response = req.send().await?;
                 HttpResponse::from_reqwest(response).await
             }
             .await;
@@ -338,18 +242,14 @@ impl HttpClient {
 
                         // Apply jitter if configured
                         if let Some(pct) = plan.retry_jitter_pct {
-                            let jitter = ((delay_ms as f64) * (f64::from(pct) / 100.0)) as u64;
-                            if jitter > 0 {
-                                // Best-effort random jitter to avoid synchronized retries.
-                                let mut bytes = [0u8; 8];
-                                let rand = if getrandom::getrandom(&mut bytes).is_ok() {
-                                    u64::from_le_bytes(bytes) % jitter
-                                } else {
-                                    // Deterministic fallback when entropy is unavailable.
-                                    u64::from(attempt).saturating_mul(997) % jitter
-                                };
-                                delay_ms = delay_ms.saturating_add(rand);
-                            }
+                            let jitter = ((delay_ms as f64) * (pct as f64 / 100.0)) as u64;
+                            // Very cheap pseudo-random from time; sufficient for jittering backoff
+                            let rand = (std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .subsec_nanos()
+                                % (jitter as u32)) as u64;
+                            delay_ms = delay_ms.saturating_add(rand);
                         }
 
                         if self.debug_enabled() {
@@ -370,11 +270,13 @@ impl HttpClient {
                     return Ok(resp);
                 }
                 Err(e) => {
-                    let is_transient = matches!(
-                        &e,
-                        TempoError::Network(NetworkError::Reqwest(re))
-                            if re.is_connect() || re.is_timeout()
-                    );
+                    let is_transient = {
+                        if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+                            re.is_connect() || re.is_timeout()
+                        } else {
+                            false
+                        }
+                    };
                     if is_transient && attempt < plan.max_retries {
                         let delay_ms = backoff;
                         if self.debug_enabled() {
@@ -400,19 +302,20 @@ impl HttpClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get};
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
 
     use super::*;
 
     fn test_client(plan: HttpRequestPlan) -> HttpClient {
         HttpClient::new(
             plan,
-            tempo_common::cli::Verbosity {
+            tempo_common::util::Verbosity {
                 level: 0,
                 show_output: false,
             },

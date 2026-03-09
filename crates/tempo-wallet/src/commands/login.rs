@@ -1,9 +1,11 @@
 //! Login command — browser-based wallet authentication (device code + PKCE flow).
 
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
-use alloy::{primitives::Address, providers::ProviderBuilder, signers::local::PrivateKeySigner};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use alloy::signers::local::PrivateKeySigner;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use colored::Colorize;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -12,33 +14,22 @@ use zeroize::Zeroizing;
 
 use super::whoami::show_whoami;
 use crate::analytics::{self, CallbackReceivedPayload, LoginFailurePayload, WalletCreatedPayload};
-use tempo_common::{
-    cli::{context::Context, output::OutputFormat},
-    error::{ConfigError, InputError, KeyError, NetworkError, TempoError},
-    keys::{Keystore, WalletType},
-    network::NetworkId,
-    security::sanitize_error,
-};
+use tempo_common::cli::context::Context;
+use tempo_common::cli::output::OutputFormat;
+use tempo_common::error::{InputError, KeyError, NetworkError, TempoError};
+use tempo_common::keys::{Keystore, WalletType};
+use tempo_common::network::NetworkId;
+use tempo_common::security::redact::sanitize_error;
 
 const CALLBACK_TIMEOUT_SECS: u64 = 900; // 15 minutes
 const POLL_INTERVAL_SECS: u64 = 2;
 
-pub(crate) async fn run(ctx: &Context) -> Result<(), TempoError> {
+pub(crate) async fn run(ctx: &Context) -> anyhow::Result<()> {
     ctx.track_event(analytics::LOGIN_STARTED);
 
     let already_logged_in = ctx.keys.has_key_for_network(ctx.network);
 
-    let needs_reauth = if already_logged_in {
-        is_key_revoked_or_expired(ctx).await
-    } else {
-        false
-    };
-
-    if needs_reauth {
-        invalidate_stale_key(ctx)?;
-    }
-
-    if !already_logged_in || needs_reauth {
+    if !already_logged_in {
         let result = do_login(ctx).await;
 
         if let Some(ref a) = ctx.analytics {
@@ -48,7 +39,7 @@ pub(crate) async fn run(ctx: &Context) -> Result<(), TempoError> {
     }
 
     if ctx.output_format == OutputFormat::Text {
-        let msg = if already_logged_in && !needs_reauth {
+        let msg = if already_logged_in {
             "Already logged in.\n"
         } else {
             "\nWallet connected!\n"
@@ -60,69 +51,16 @@ pub(crate) async fn run(ctx: &Context) -> Result<(), TempoError> {
     show_whoami(ctx, Some(&keys), None).await
 }
 
-/// Check whether the stored access key has been revoked or has expired on-chain.
-///
-/// Returns `true` when the key is definitively invalid, `false` otherwise
-/// (including on RPC errors — we don't want network failures to block login).
-async fn is_key_revoked_or_expired(ctx: &Context) -> bool {
-    let Some(key_entry) = ctx.keys.key_for_network(ctx.network) else {
-        return false;
-    };
-    let Some(wallet_address) = key_entry.wallet_address_parsed() else {
-        return false;
-    };
-    let Some(key_address) = key_entry.key_address_parsed() else {
-        return false;
-    };
-    // Direct EOA keys (wallet == signer) are not keychain-managed
-    if key_entry.is_direct_eoa_key() {
-        return false;
-    }
-
-    let rpc_url = ctx.config.rpc_url(ctx.network);
-    let provider = ProviderBuilder::new().connect_http(rpc_url);
-    let token = ctx.network.token();
-
-    match mpp::client::tempo::signing::keychain::query_key_spending_limit(
-        &provider,
-        wallet_address,
-        key_address,
-        token.address,
-    )
-    .await
-    {
-        Ok(_) => false,
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            msg.contains("revoked") || msg.contains("expired")
-        }
-    }
-}
-
-/// Remove a revoked/expired key so the fresh login flow can proceed.
-fn invalidate_stale_key(ctx: &Context) -> Result<(), TempoError> {
-    let Some(key_entry) = ctx.keys.key_for_network(ctx.network) else {
-        return Ok(());
-    };
-    let Some(wallet_address) = key_entry.wallet_address_parsed() else {
-        return Ok(());
-    };
-
-    let mut keys = ctx.keys.clone();
-    keys.delete_passkey_wallet_address(wallet_address)?;
-    keys.save()?;
-
-    if ctx.output_format == OutputFormat::Text {
-        eprintln!("Existing access key is no longer valid. Re-authenticating...");
-    }
-    Ok(())
-}
-
-fn track_login_result(a: &tempo_common::analytics::Analytics, result: &Result<(), TempoError>) {
+fn track_login_result(a: &tempo_common::analytics::Analytics, result: &anyhow::Result<()>) {
     match result {
-        Ok(()) => a.track_event(analytics::LOGIN_SUCCESS),
+        Ok(_) => a.track_event(analytics::LOGIN_SUCCESS),
         Err(e) => {
-            let is_timeout = matches!(e, TempoError::Key(KeyError::LoginExpired));
+            let is_timeout = e.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref(),
+                    Some(TempoError::Key(KeyError::LoginExpired))
+                )
+            });
             if is_timeout {
                 a.track_event(analytics::LOGIN_TIMEOUT);
             } else {
@@ -137,14 +75,12 @@ fn track_login_result(a: &tempo_common::analytics::Analytics, result: &Result<()
     }
 }
 
-async fn do_login(ctx: &Context) -> Result<(), TempoError> {
+async fn do_login(ctx: &Context) -> anyhow::Result<()> {
     let auth_server_url =
         std::env::var("TEMPO_AUTH_URL").unwrap_or_else(|_| ctx.network.auth_url().to_string());
 
-    let parsed_url = Url::parse(&auth_server_url).map_err(|source| InputError::UrlParseFor {
-        context: "auth server",
-        source,
-    })?;
+    let parsed_url = Url::parse(&auth_server_url)
+        .map_err(|e| InputError::InvalidUrl(format!("auth server: {e}")))?;
     let auth_base_url = parsed_url.origin().ascii_serialization();
 
     let local_signer = PrivateKeySigner::random();
@@ -154,27 +90,17 @@ async fn do_login(ctx: &Context) -> Result<(), TempoError> {
         .to_encoded_point(false);
     let pub_key = format!("0x{}", hex::encode(uncompressed.as_bytes()));
 
-    let (code_verifier, code_challenge) = generate_pkce_pair()?;
+    let (code_verifier, code_challenge) = generate_pkce_pair();
 
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(NetworkError::Reqwest)?;
+    let client = reqwest::Client::new();
     let code = create_device_code(&client, &auth_base_url, &pub_key, &code_challenge).await?;
 
     let mut auth_url = parsed_url;
     auth_url.query_pairs_mut().append_pair("code", &code);
     let url_str = auth_url.to_string();
 
-    // Always print a manual fallback URL, even in machine output modes.
-    eprintln!("Auth URL: {url_str}");
-
-    // Always attempt browser open, even in machine output modes.
-    // Some agents run login with non-text output (`-t`/JSON) and still need
-    // the browser flow to start.
-    super::auth::try_open_browser(&url_str);
-
     if ctx.output_format == OutputFormat::Text {
-        show_login_prompt(&code);
+        prompt_and_open_browser(&code, &url_str);
     }
 
     ctx.track_event(analytics::CALLBACK_WINDOW_OPENED);
@@ -204,16 +130,41 @@ async fn do_login(ctx: &Context) -> Result<(), TempoError> {
     Ok(())
 }
 
-/// Display the verification code and wait prompt for authentication.
-fn show_login_prompt(code: &str) {
+/// Display the verification code and open the browser for authentication.
+fn prompt_and_open_browser(code: &str, url: &str) {
     let display_code = if code.len() == 8 {
         format!("{}-{}", &code[..4], &code[4..])
     } else {
         code.to_string()
     };
-    eprintln!("Verification code: {}", display_code.bold());
     eprintln!();
+    eprintln!("Verification code: {}", display_code.bold());
+
+    if std::io::stdin().is_terminal() {
+        eprint!(
+            "{} to open your browser to {}... ",
+            "Press Enter".bold(),
+            url
+        );
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().read_line(&mut String::new());
+            try_open_browser(&url);
+        });
+    } else {
+        eprintln!("Opening browser to {}...", url);
+        try_open_browser(url);
+    }
+
     eprintln!("Waiting for authentication...");
+}
+
+fn try_open_browser(url: &str) {
+    if let Err(e) = webbrowser::open(url) {
+        eprintln!("Failed to open browser: {}", e);
+        eprintln!("Please open this URL manually: {}", url);
+    }
 }
 
 struct AuthCallback {
@@ -243,20 +194,16 @@ async fn poll_until_authorized(
             if err.to_lowercase().contains("expired") {
                 return Err(KeyError::LoginExpired.into());
             }
-            // Intentional server-provided reason passthrough: the poll response only
-            // contains a string error field (no structured source object).
-            return Err(NetworkError::ResponseSchema {
-                context: "login poll response",
-                reason: err.clone(),
-            }
-            .into());
+            return Err(NetworkError::Http(err.clone()).into());
         }
 
         if resp.status == PollStatus::Authorized {
             return Ok(AuthCallback {
-                account_address: resp
-                    .account_address
-                    .ok_or_else(|| TempoError::from(InputError::MissingAuthorizedAccountAddress))?,
+                account_address: resp.account_address.ok_or_else(|| {
+                    TempoError::from(NetworkError::Http(
+                        "Missing account_address in authorized response".to_string(),
+                    ))
+                })?,
                 key_authorization: resp.key_authorization,
                 duration_secs: start.elapsed().as_secs(),
             });
@@ -273,15 +220,6 @@ fn save_keys(
     callback: AuthCallback,
     local_signer: PrivateKeySigner,
 ) -> Result<(), TempoError> {
-    let wallet_address: Address =
-        callback
-            .account_address
-            .parse()
-            .map_err(|_| ConfigError::InvalidAddress {
-                context: "authorized response account_address",
-                value: callback.account_address.clone(),
-            })?;
-
     let validated = tempo_common::keys::authorization::validate(
         callback.key_authorization.as_deref(),
         local_signer.address(),
@@ -289,7 +227,7 @@ fn save_keys(
     let key_auth_hex = validated.as_ref().map(|v| v.hex.clone());
 
     let access_key_hex = Zeroizing::new(format!("0x{}", hex::encode(local_signer.to_bytes())));
-    let access_key_address = local_signer.address();
+    let access_key_address = local_signer.address().to_string();
 
     let mut keys = keys.clone();
 
@@ -299,7 +237,13 @@ fn save_keys(
         .and_then(|v| (v.chain_id != 0).then_some(v.chain_id))
         .unwrap_or(default_chain_id);
 
-    let entry = keys.upsert_by_wallet_address_and_chain(wallet_address, chain_id);
+    let entry = keys.upsert_by_wallet_and_chain(&callback.account_address, chain_id);
+
+    let keep_provisioned = entry
+        .key_address
+        .as_deref()
+        .is_some_and(|a| a == access_key_address)
+        && entry.provisioned;
 
     if let Some(ref v) = validated {
         entry.key_type = v.key_type;
@@ -308,10 +252,11 @@ fn save_keys(
     }
 
     entry.wallet_type = WalletType::Passkey;
-    entry.set_wallet_address(wallet_address);
-    entry.set_key_address(Some(access_key_address));
+    entry.wallet_address = callback.account_address;
+    entry.key_address = Some(access_key_address);
     entry.key = Some(access_key_hex);
     entry.key_authorization = key_auth_hex;
+    entry.provisioned = keep_provisioned;
 
     keys.save()
 }
@@ -338,7 +283,7 @@ async fn create_device_code(
     pub_key: &str,
     code_challenge: &str,
 ) -> Result<String, TempoError> {
-    let url = format!("{base_url}/cli-auth/device-code");
+    let url = format!("{}/cli-auth/device-code", base_url);
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -348,16 +293,15 @@ async fn create_device_code(
         }))
         .send()
         .await
-        .map_err(NetworkError::Reqwest)?;
+        .map_err(|e| NetworkError::Http(format!("Failed to create device code: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.map_err(NetworkError::Reqwest)?;
-        return Err(NetworkError::HttpStatus {
-            operation: "request device code",
-            status: status.as_u16(),
-            body: Some(body),
-        }
+        let body = resp.text().await.unwrap_or_default();
+        return Err(NetworkError::Http(format!(
+            "Device code request failed ({}): {}",
+            status, body
+        ))
         .into());
     }
 
@@ -366,14 +310,15 @@ async fn create_device_code(
         code: String,
     }
 
-    let body = resp.text().await.map_err(NetworkError::Reqwest)?;
-    serde_json::from_str::<DeviceCodeResponse>(&body)
+    resp.json::<DeviceCodeResponse>()
+        .await
         .map(|r| r.code)
-        .map_err(|source| NetworkError::ResponseParse {
-            context: "login device code response",
-            source,
+        .map_err(|e| {
+            TempoError::from(NetworkError::Http(format!(
+                "Failed to parse device code response: {}",
+                e
+            )))
         })
-        .map_err(TempoError::from)
 }
 
 async fn poll_device_code(
@@ -382,7 +327,7 @@ async fn poll_device_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<PollResponse, TempoError> {
-    let url = format!("{base_url}/cli-auth/poll/{code}");
+    let url = format!("{}/cli-auth/poll/{}", base_url, code);
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -390,7 +335,7 @@ async fn poll_device_code(
         }))
         .send()
         .await
-        .map_err(NetworkError::Reqwest)?;
+        .map_err(|e| NetworkError::Http(format!("Failed to poll device code: {}", e)))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(KeyError::LoginExpired.into());
@@ -398,37 +343,30 @@ async fn poll_device_code(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.map_err(NetworkError::Reqwest)?;
-        return Err(NetworkError::HttpStatus {
-            operation: "poll login status",
-            status: status.as_u16(),
-            body: Some(body),
-        }
-        .into());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(
+            NetworkError::Http(format!("Poll request failed ({}): {}", status, body)).into(),
+        );
     }
 
-    let body = resp.text().await.map_err(NetworkError::Reqwest)?;
-    serde_json::from_str::<PollResponse>(&body)
-        .map_err(|source| NetworkError::ResponseParse {
-            context: "login poll response",
-            source,
-        })
-        .map_err(TempoError::from)
+    resp.json::<PollResponse>().await.map_err(|e| {
+        TempoError::from(NetworkError::Http(format!(
+            "Failed to parse poll response: {}",
+            e
+        )))
+    })
 }
 
-fn generate_pkce_pair() -> Result<(String, String), TempoError> {
+fn generate_pkce_pair() -> (String, String) {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|source| KeyError::SigningOperationSource {
-        operation: "generate PKCE verifier",
-        source: Box::new(source),
-    })?;
+    getrandom::getrandom(&mut bytes).expect("failed to generate random bytes");
     let verifier = URL_SAFE_NO_PAD.encode(bytes);
 
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
-    Ok((verifier, challenge))
+    (verifier, challenge)
 }
 
 #[cfg(test)]
@@ -437,14 +375,14 @@ mod tests {
 
     #[test]
     fn test_pkce_pair_lengths() {
-        let (verifier, challenge) = generate_pkce_pair().expect("pkce generation should succeed");
+        let (verifier, challenge) = generate_pkce_pair();
         assert_eq!(verifier.len(), 43);
         assert_eq!(challenge.len(), 43);
     }
 
     #[test]
     fn test_pkce_pair_is_base64url() {
-        let (verifier, challenge) = generate_pkce_pair().expect("pkce generation should succeed");
+        let (verifier, challenge) = generate_pkce_pair();
         let is_base64url = |s: &str| {
             s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -468,8 +406,8 @@ mod tests {
 
     #[test]
     fn test_pkce_pairs_are_unique() {
-        let (v1, _) = generate_pkce_pair().expect("pkce generation should succeed");
-        let (v2, _) = generate_pkce_pair().expect("pkce generation should succeed");
+        let (v1, _) = generate_pkce_pair();
+        let (v2, _) = generate_pkce_pair();
         assert_ne!(v1, v2);
     }
 }

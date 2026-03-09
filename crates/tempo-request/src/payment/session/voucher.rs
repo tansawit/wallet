@@ -1,14 +1,13 @@
 //! Voucher credential construction for session payments.
 
 use alloy::primitives::{Address, B256};
+use anyhow::{Context, Result};
 
-use mpp::{
-    protocol::methods::tempo::{session::SessionCredentialPayload, sign_voucher},
-    ChallengeEcho,
-};
+use mpp::protocol::methods::tempo::session::SessionCredentialPayload;
+use mpp::protocol::methods::tempo::sign_voucher;
+use mpp::ChallengeEcho;
 
-use super::ChannelState;
-use tempo_common::error::{KeyError, TempoError};
+use super::SessionState;
 
 /// Build a `SessionCredentialPayload::Open` with the given transaction bytes.
 pub(super) fn build_open_payload(
@@ -20,9 +19,9 @@ pub(super) fn build_open_payload(
 ) -> SessionCredentialPayload {
     SessionCredentialPayload::Open {
         payload_type: "transaction".to_string(),
-        channel_id: format!("{channel_id:#x}"),
+        channel_id: format!("{:#x}", channel_id),
         transaction,
-        authorized_signer: Some(format!("{authorized_signer:#x}")),
+        authorized_signer: Some(format!("{:#x}", authorized_signer)),
         cumulative_amount: cumulative_amount.to_string(),
         signature: format!("0x{}", hex::encode(voucher_sig)),
     }
@@ -30,23 +29,20 @@ pub(super) fn build_open_payload(
 
 /// Build a voucher credential for an existing session.
 pub(super) async fn build_voucher_credential(
-    signer: &tempo_common::keys::Signer,
+    signer: &alloy::signers::local::PrivateKeySigner,
     echo: &ChallengeEcho,
     did: &str,
-    state: &ChannelState,
-) -> Result<mpp::PaymentCredential, TempoError> {
+    state: &SessionState,
+) -> Result<mpp::PaymentCredential> {
     let sig = sign_voucher(
-        &signer.signer,
+        signer,
         state.channel_id,
         state.cumulative_amount,
         state.escrow_contract,
         state.chain_id,
     )
     .await
-    .map_err(|source| KeyError::SigningOperationSource {
-        operation: "sign voucher",
-        source: Box::new(source),
-    })?;
+    .context("Failed to sign voucher")?;
 
     let payload = SessionCredentialPayload::Voucher {
         channel_id: format!("{:#x}", state.channel_id),
@@ -59,18 +55,4 @@ pub(super) async fn build_voucher_credential(
         did.to_string(),
         payload,
     ))
-}
-
-/// Build a `SessionCredentialPayload::TopUp` from a signed top-up transaction.
-pub(super) fn build_top_up_payload(
-    channel_id: B256,
-    transaction: String,
-    additional_deposit: u128,
-) -> SessionCredentialPayload {
-    SessionCredentialPayload::TopUp {
-        payload_type: "transaction".to_string(),
-        channel_id: format!("{channel_id:#x}"),
-        transaction,
-        additional_deposit: additional_deposit.to_string(),
-    }
 }
