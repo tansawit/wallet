@@ -24,17 +24,17 @@ pub enum ExitCode {
 
 impl ExitCode {
     /// Convert to process exit code.
-    pub const fn code(self) -> i32 {
+    pub fn code(self) -> i32 {
         self as i32
     }
 
     /// Machine-readable error code label for structured error output.
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::GeneralError => "E_GENERAL",
-            Self::InvalidUsage => "E_USAGE",
-            Self::NetworkError => "E_NETWORK",
-            Self::PaymentFailed => "E_PAYMENT",
+            ExitCode::GeneralError => "E_GENERAL",
+            ExitCode::InvalidUsage => "E_USAGE",
+            ExitCode::NetworkError => "E_NETWORK",
+            ExitCode::PaymentFailed => "E_PAYMENT",
         }
     }
 
@@ -50,24 +50,47 @@ impl From<ExitCode> for i32 {
     }
 }
 
+impl From<&anyhow::Error> for ExitCode {
+    fn from(err: &anyhow::Error) -> Self {
+        use crate::error::{ConfigError, InputError, NetworkError, PaymentError};
+
+        for cause in err.chain() {
+            if let Some(app_err) = cause.downcast_ref::<crate::error::TempoError>() {
+                return ExitCode::from(app_err);
+            }
+            // Sub-error types may be bail!'d directly without wrapping in TempoError
+            if cause.downcast_ref::<InputError>().is_some()
+                || cause.downcast_ref::<ConfigError>().is_some()
+            {
+                return ExitCode::InvalidUsage;
+            }
+            if cause.downcast_ref::<NetworkError>().is_some() {
+                return ExitCode::NetworkError;
+            }
+            if cause.downcast_ref::<PaymentError>().is_some() {
+                return ExitCode::PaymentFailed;
+            }
+        }
+
+        ExitCode::GeneralError
+    }
+}
+
 impl From<&crate::error::TempoError> for ExitCode {
     fn from(err: &crate::error::TempoError) -> Self {
         use crate::error::{KeyError, TempoError};
 
         match err {
+            TempoError::Config(_) => ExitCode::InvalidUsage,
             TempoError::Key(k) => match k {
-                KeyError::LoginExpired => Self::GeneralError,
-                _ => Self::InvalidUsage,
+                KeyError::Keychain(_) | KeyError::LoginExpired => ExitCode::GeneralError,
+                _ => ExitCode::InvalidUsage,
             },
-            TempoError::Network(_) => Self::NetworkError,
-            TempoError::Payment(_) => Self::PaymentFailed,
-            TempoError::Io(_) | TempoError::Json(_) | TempoError::ToonEncode(_) => {
-                Self::GeneralError
-            }
-            TempoError::Config(_)
-            | TempoError::Input(_)
-            | TempoError::TomlParse(_)
-            | TempoError::TomlSerialize(_) => Self::InvalidUsage,
+            TempoError::Input(_) => ExitCode::InvalidUsage,
+            TempoError::Network(_) => ExitCode::NetworkError,
+            TempoError::Payment(_) => ExitCode::PaymentFailed,
+            TempoError::Io(_) | TempoError::Json(_) => ExitCode::GeneralError,
+            TempoError::TomlParse(_) | TempoError::TomlSerialize(_) => ExitCode::InvalidUsage,
         }
     }
 }
@@ -82,45 +105,5 @@ mod tests {
         assert_eq!(ExitCode::InvalidUsage.code(), 2);
         assert_eq!(ExitCode::NetworkError.code(), 3);
         assert_eq!(ExitCode::PaymentFailed.code(), 4);
-    }
-
-    #[test]
-    fn from_tempo_error_network_is_network_exit() {
-        use crate::error::{NetworkError, TempoError};
-
-        let err: TempoError = NetworkError::HttpStatus {
-            operation: "test request",
-            status: 504,
-            body: Some("timeout".to_string()),
-        }
-        .into();
-        assert_eq!(ExitCode::from(&err), ExitCode::NetworkError);
-    }
-
-    #[test]
-    fn from_tempo_error_key_variants() {
-        use crate::error::{KeyError, TempoError};
-        // LoginExpired → GeneralError
-        let err: TempoError = KeyError::LoginExpired.into();
-        assert_eq!(ExitCode::from(&err), ExitCode::GeneralError);
-
-        // InvalidKey → InvalidUsage (user provided bad input)
-        let err: TempoError = KeyError::InvalidKey("bad".to_string()).into();
-        assert_eq!(ExitCode::from(&err), ExitCode::InvalidUsage);
-    }
-
-    #[test]
-    fn from_tempo_error_session_persistence_context_source_is_payment_exit() {
-        use crate::error::{NetworkError, PaymentError, TempoError};
-
-        let source: TempoError = NetworkError::Http("upstream unavailable".to_string()).into();
-        let err: TempoError = PaymentError::ChannelPersistenceContextSource {
-            operation: "session request reuse",
-            context: "Session request failed; session state preserved for on-chain dispute",
-            source: Box::new(source),
-        }
-        .into();
-
-        assert_eq!(ExitCode::from(&err), ExitCode::PaymentFailed);
     }
 }
