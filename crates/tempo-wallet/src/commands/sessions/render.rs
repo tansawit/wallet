@@ -1,17 +1,13 @@
 //! Session rendering: view models and output rendering (text, JSON).
 
-use alloy::primitives::{utils::format_units, U256};
+use alloy::primitives::utils::format_units;
+use alloy::primitives::U256;
 use serde::Serialize;
 
-use super::{session, ChannelStatus};
-use tempo_common::{
-    cli::{
-        format::{format_duration, format_relative_time, format_utc_timestamp},
-        output,
-        output::OutputFormat,
-    },
-    error::TempoError,
-};
+use super::{session_store, SessionStatus};
+use tempo_common::cli::format::{format_duration, format_relative_time};
+use tempo_common::cli::output;
+use tempo_common::cli::output::OutputFormat;
 
 // ---------------------------------------------------------------------------
 // ChannelView — unified view model for session/channel display
@@ -25,15 +21,15 @@ pub(super) struct ChannelView {
     pub(super) channel_id: String,
     pub(super) network: String,
     /// When `Some`, the Channel line is shown in text output.
-    /// Non-empty values are used as the header; empty values fall back to `channel_id`.
-    /// When `None`, `channel_id` is the header and no Channel line is shown.
+    /// Non-empty values are used as the header; empty values fall back to channel_id.
+    /// When `None`, channel_id is the header and no Channel line is shown.
     pub(super) origin: Option<String>,
     pub(super) symbol: &'static str,
     pub(super) unlimited: bool,
     pub(super) deposit: String,
     pub(super) spent: String,
     pub(super) remaining: String,
-    pub(super) status: ChannelStatus,
+    pub(super) status: SessionStatus,
     pub(super) remaining_secs: Option<u64>,
     pub(super) created_at: Option<u64>,
     pub(super) last_used_at: Option<u64>,
@@ -54,19 +50,19 @@ impl ChannelView {
         let remaining = deposit.saturating_sub(settled);
 
         let (status, remaining_secs) = if close_requested_at > 0 {
-            let now = session::now_secs();
+            let now = session_store::now_secs();
             let ready_at = close_requested_at + grace_period;
             let rem = ready_at.saturating_sub(now);
             if rem == 0 {
-                (ChannelStatus::Finalizable, Some(0))
+                (SessionStatus::Finalizable, Some(0))
             } else {
-                (ChannelStatus::Closing, Some(rem))
+                (SessionStatus::Closing, Some(rem))
             }
         } else {
-            (ChannelStatus::Orphaned, None)
+            (SessionStatus::Orphaned, None)
         };
 
-        Self {
+        ChannelView {
             channel_id: channel_id.to_string(),
             network: network.as_str().to_string(),
             origin: None,
@@ -83,19 +79,19 @@ impl ChannelView {
     }
 }
 
-impl From<&session::ChannelRecord> for ChannelView {
-    fn from(session: &session::ChannelRecord) -> Self {
+impl From<&session_store::SessionRecord> for ChannelView {
+    fn from(session: &session_store::SessionRecord) -> Self {
         let t = session.network_id().token();
 
-        let spent_u = session.accepted_cumulative_u128();
-        let limit_u = session.deposit_u128();
+        let spent_u = session.cumulative_amount_u128().unwrap_or(0);
+        let limit_u = session.deposit_u128().unwrap_or(0);
         let remaining_u = limit_u.saturating_sub(spent_u);
 
-        let (status, remaining_secs) = session.status_at(session::now_secs());
+        let (status, remaining_secs) = session.status_at(session_store::now_secs());
 
-        Self {
-            channel_id: session.channel_id_hex(),
-            network: session.network_id().as_str().to_string(),
+        ChannelView {
+            channel_id: session.channel_id.clone(),
+            network: session.network_name.clone(),
             origin: Some(session.origin.clone()),
             symbol: t.symbol,
             unlimited: limit_u == 0,
@@ -128,9 +124,9 @@ struct SessionItem<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     remaining_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    created_at: Option<String>,
+    created_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_used_at: Option<String>,
+    last_used_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -149,8 +145,8 @@ pub(super) fn render_channel_list(
     output_format: OutputFormat,
     empty_msg: &str,
     count_label: &str,
-) -> Result<(), TempoError> {
-    let items: Vec<SessionItem<'_>> = views
+) -> anyhow::Result<()> {
+    let items: Vec<SessionItem> = views
         .iter()
         .map(|v| SessionItem {
             channel_id: &v.channel_id,
@@ -165,8 +161,8 @@ pub(super) fn render_channel_list(
             remaining: &v.remaining,
             status: v.status.as_str(),
             remaining_secs: v.remaining_secs,
-            created_at: v.created_at.map(format_utc_timestamp),
-            last_used_at: v.last_used_at.map(format_utc_timestamp),
+            created_at: v.created_at,
+            last_used_at: v.last_used_at,
         })
         .collect();
     let structured_payload = SessionListResponse {
@@ -186,9 +182,7 @@ pub(super) fn render_channel_list(
             println!("{} {count_label}.", views.len());
         }
         Ok(())
-    })?;
-
-    Ok(())
+    })
 }
 
 /// Render a single channel in text format.
@@ -226,7 +220,7 @@ fn render_channel_text(v: &ChannelView) {
     let status_str = v.status.as_str();
     let status_display = match v.remaining_secs {
         Some(0) => match v.status {
-            ChannelStatus::Closing | ChannelStatus::Finalizable => {
+            SessionStatus::Closing | SessionStatus::Finalizable => {
                 "finalizable — ready to finalize".to_string()
             }
             _ => format!("{status_str} — ready to finalize"),
@@ -247,7 +241,7 @@ mod tests {
     use super::*;
     use tempo_common::cli::output::OutputFormat;
 
-    fn make_channel_view(status: ChannelStatus, remaining_secs: Option<u64>) -> ChannelView {
+    fn make_channel_view(status: SessionStatus, remaining_secs: Option<u64>) -> ChannelView {
         ChannelView {
             channel_id: "0xabc123".to_string(),
             network: "tempo".to_string(),
@@ -292,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_list_json_with_entries() {
-        let views = vec![make_channel_view(ChannelStatus::Active, None)];
+        let views = vec![make_channel_view(SessionStatus::Active, None)];
         let result = render_channel_list(
             &views,
             OutputFormat::Json,
@@ -304,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_list_text_with_entries() {
-        let views = vec![make_channel_view(ChannelStatus::Active, None)];
+        let views = vec![make_channel_view(SessionStatus::Active, None)];
         let result = render_channel_list(
             &views,
             OutputFormat::Text,
@@ -316,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_list_with_closed_status() {
-        let views = vec![make_channel_view(ChannelStatus::Closing, Some(120))];
+        let views = vec![make_channel_view(SessionStatus::Closing, Some(120))];
         let result = render_channel_list(
             &views,
             OutputFormat::Text,
@@ -328,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_list_ready_to_finalize() {
-        let views = vec![make_channel_view(ChannelStatus::Finalizable, Some(0))];
+        let views = vec![make_channel_view(SessionStatus::Finalizable, Some(0))];
         let result = render_channel_list(
             &views,
             OutputFormat::Text,
@@ -340,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_no_origin_uses_channel_id() {
-        let mut v = make_channel_view(ChannelStatus::Orphaned, None);
+        let mut v = make_channel_view(SessionStatus::Orphaned, None);
         v.origin = None;
         let result =
             render_channel_list(&[v], OutputFormat::Text, "No sessions.", "session(s) total");
@@ -349,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_render_channel_empty_origin_uses_channel_id() {
-        let mut v = make_channel_view(ChannelStatus::Orphaned, None);
+        let mut v = make_channel_view(SessionStatus::Orphaned, None);
         v.origin = Some(String::new());
         let result =
             render_channel_list(&[v], OutputFormat::Json, "No sessions.", "session(s) total");

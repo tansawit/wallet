@@ -1,10 +1,12 @@
 //! Service directory data model and formatting helpers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-pub(super) const SERVICES_API_URL: &str = "https://mpp.sh/api/services";
+// Protection-bypass token is a public API key for unauthenticated access.
+pub(super) const SERVICES_API_URL: &str =
+    "https://mpp.sh/api/services?x-vercel-protection-bypass=iGDnLnmF0nK6LWloAotUbTo3urEsaIkB";
 
 #[derive(Deserialize)]
 pub(super) struct ServiceRegistry {
@@ -72,62 +74,6 @@ pub(super) struct Endpoint {
     pub(super) docs: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EndpointMethod<'a> {
-    Get,
-    Post,
-    Put,
-    Patch,
-    Delete,
-    Head,
-    Options,
-    Other(&'a str),
-}
-
-impl<'a> EndpointMethod<'a> {
-    const fn parse(value: &'a str) -> Self {
-        if value.eq_ignore_ascii_case("GET") {
-            return Self::Get;
-        }
-        if value.eq_ignore_ascii_case("POST") {
-            return Self::Post;
-        }
-        if value.eq_ignore_ascii_case("PUT") {
-            return Self::Put;
-        }
-        if value.eq_ignore_ascii_case("PATCH") {
-            return Self::Patch;
-        }
-        if value.eq_ignore_ascii_case("DELETE") {
-            return Self::Delete;
-        }
-        if value.eq_ignore_ascii_case("HEAD") {
-            return Self::Head;
-        }
-        if value.eq_ignore_ascii_case("OPTIONS") {
-            return Self::Options;
-        }
-        Self::Other(value)
-    }
-
-    pub(super) const fn as_str(self) -> &'a str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Patch => "PATCH",
-            Self::Delete => "DELETE",
-            Self::Head => "HEAD",
-            Self::Options => "OPTIONS",
-            Self::Other(value) => value,
-        }
-    }
-
-    pub(super) const fn supports_body(self) -> bool {
-        !matches!(self, Self::Get | Self::Head)
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct EndpointPayment {
     pub(super) intent: String,
@@ -153,26 +99,20 @@ pub(super) struct Provider {
     pub(super) icon: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceId(String);
-
-impl ServiceId {
-    fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase();
-        (!normalized.is_empty()).then_some(Self(normalized))
-    }
-}
-
 impl ServiceRegistry {
     pub(super) fn find(&self, id: &str) -> Option<&Service> {
-        let target = ServiceId::parse(id)?;
-        self.services
-            .iter()
-            .find(|s| ServiceId::parse(&s.id).as_ref() == Some(&target))
+        self.services.iter().find(|s| s.id.eq_ignore_ascii_case(id))
     }
 }
 
 impl Service {
+    pub(super) fn payment_intents(&self) -> BTreeSet<&str> {
+        self.methods
+            .values()
+            .flat_map(|m| m.intents.iter().map(|i| i.as_str()))
+            .collect()
+    }
+
     pub(super) fn format_categories(&self) -> String {
         if self.categories.is_empty() {
             "—".to_string()
@@ -180,13 +120,18 @@ impl Service {
             self.categories.join(", ")
         }
     }
+
+    pub(super) fn format_payment_intents(&self) -> String {
+        let intents = self.payment_intents();
+        if intents.is_empty() {
+            "—".to_string()
+        } else {
+            intents.into_iter().collect::<Vec<_>>().join(", ")
+        }
+    }
 }
 
 impl Endpoint {
-    pub(super) fn method_kind(&self) -> EndpointMethod<'_> {
-        EndpointMethod::parse(&self.method)
-    }
-
     pub(super) fn format_pricing(&self) -> String {
         match &self.payment {
             None => "free".to_string(),
@@ -298,56 +243,38 @@ mod tests {
     }
 
     #[test]
-    fn service_find_normalizes_identifier() {
-        let registry = ServiceRegistry {
-            services: vec![Service {
-                id: "MY-SERVICE".to_string(),
-                name: "n".to_string(),
-                url: "u".to_string(),
-                service_url: None,
-                description: None,
-                icon: None,
-                categories: Vec::new(),
-                integration: None,
-                tags: Vec::new(),
-                status: None,
-                docs: None,
-                methods: HashMap::new(),
-                realm: None,
-                endpoints: Vec::new(),
-                provider: None,
-            }],
-        };
-
-        assert!(registry.find("my-service").is_some());
-        assert!(registry.find("  my-service  ").is_some());
-        assert!(registry.find("").is_none());
-    }
-
-    #[test]
-    fn endpoint_method_is_normalized() {
-        let endpoint = Endpoint {
-            method: "post".into(),
-            path: "/v1/test".into(),
+    fn payment_intents_deduplicates() {
+        let mut methods = HashMap::new();
+        methods.insert(
+            "a".into(),
+            PaymentMethod {
+                intents: vec!["charge".into(), "session".into()],
+            },
+        );
+        methods.insert(
+            "b".into(),
+            PaymentMethod {
+                intents: vec!["session".into()],
+            },
+        );
+        let s = Service {
+            id: "test".into(),
+            name: "Test".into(),
+            url: "https://example.com".into(),
+            service_url: None,
             description: None,
-            payment: None,
+            icon: None,
+            categories: vec![],
+            integration: None,
+            tags: vec![],
+            status: None,
             docs: None,
+            methods,
+            realm: None,
+            endpoints: vec![],
+            provider: None,
         };
-
-        assert_eq!(endpoint.method_kind().as_str(), "POST");
-        assert!(endpoint.method_kind().supports_body());
-    }
-
-    #[test]
-    fn endpoint_method_get_disables_body_examples() {
-        let endpoint = Endpoint {
-            method: "GET".into(),
-            path: "/v1/test".into(),
-            description: None,
-            payment: None,
-            docs: None,
-        };
-
-        assert!(!endpoint.method_kind().supports_body());
+        let intents: Vec<&str> = s.payment_intents().into_iter().collect();
+        assert_eq!(intents, vec!["charge", "session"]);
     }
 }
