@@ -1,11 +1,9 @@
 //! Mock servers for integration tests: HTTP, JSON-RPC, and MPP service directory.
 
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{any, get},
-    Json, Router,
-};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{any, get};
+use axum::{Json, Router};
 use serde_json::json;
 
 // ── Generic HTTP mock ───────────────────────────────────────────────────
@@ -15,16 +13,10 @@ pub struct MockServer {
     pub base_url: String,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     _handle: tokio::task::JoinHandle<()>,
-    /// Deferred www-authenticate header (set after server binds).
-    www_auth_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<String>>>,
 }
 
 impl MockServer {
     /// Start a server that always returns the given status, headers, and body.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start(status: u16, headers: Vec<(&str, &str)>, body: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -65,20 +57,15 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
         }
     }
 
     /// Start a payment mock: returns 402 + WWW-Authenticate when no Authorization
     /// header is present, returns 200 + body when Authorization header is present.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_payment(www_authenticate: &str, success_body: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -118,19 +105,14 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
         }
     }
 
     /// Start a payment mock that also returns a Payment-Receipt header on success.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_payment_with_receipt(
         www_authenticate: &str,
         success_body: &str,
@@ -181,197 +163,14 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
-        }
-    }
-
-    /// Set the WWW-Authenticate header for a deferred payment mock.
-    pub fn set_www_authenticate(&self, value: &str) {
-        if let Some(tx) = &self.www_auth_tx {
-            let _ = tx.send(value.to_string());
-        }
-    }
-
-    /// Start a payment mock where the WWW-Authenticate header is set after binding.
-    ///
-    /// Call [`Self::set_www_authenticate`] after construction to provide the header.
-    pub async fn start_payment_deferred(success_body: &str) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(String::new());
-        let watch_tx = std::sync::Arc::new(watch_tx);
-        let owned_body = success_body.to_string();
-
-        let app = Router::new().route(
-            "/{*path}",
-            any(move |headers: axum::http::HeaderMap| {
-                let rx = watch_rx.clone();
-                let b = owned_body.clone();
-                async move {
-                    if headers.get("authorization").is_some() {
-                        (StatusCode::OK, b).into_response()
-                    } else {
-                        let h = rx.borrow().clone();
-                        let mut response =
-                            (StatusCode::PAYMENT_REQUIRED, "Payment Required").into_response();
-                        response.headers_mut().insert(
-                            axum::http::HeaderName::from_static("www-authenticate"),
-                            axum::http::HeaderValue::from_str(&h).unwrap(),
-                        );
-                        response
-                    }
-                }
-            }),
-        );
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        Self {
-            base_url,
-            shutdown_tx: Some(shutdown_tx),
-            _handle: handle,
-            www_auth_tx: Some(watch_tx),
-        }
-    }
-
-    /// Start a deferred payment mock and delay paid responses by `success_delay_ms`.
-    ///
-    /// This is useful for deterministic overlap in concurrency tests.
-    pub async fn start_payment_deferred_with_delay(
-        success_body: &str,
-        success_delay_ms: u64,
-    ) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(String::new());
-        let watch_tx = std::sync::Arc::new(watch_tx);
-        let owned_body = success_body.to_string();
-
-        let app = Router::new().route(
-            "/{*path}",
-            any(move |headers: axum::http::HeaderMap| {
-                let rx = watch_rx.clone();
-                let b = owned_body.clone();
-                async move {
-                    if headers.get("authorization").is_some() {
-                        if success_delay_ms > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(success_delay_ms))
-                                .await;
-                        }
-                        (StatusCode::OK, b).into_response()
-                    } else {
-                        let h = rx.borrow().clone();
-                        let mut response =
-                            (StatusCode::PAYMENT_REQUIRED, "Payment Required").into_response();
-                        response.headers_mut().insert(
-                            axum::http::HeaderName::from_static("www-authenticate"),
-                            axum::http::HeaderValue::from_str(&h).unwrap(),
-                        );
-                        response
-                    }
-                }
-            }),
-        );
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        Self {
-            base_url,
-            shutdown_tx: Some(shutdown_tx),
-            _handle: handle,
-            www_auth_tx: Some(watch_tx),
-        }
-    }
-
-    /// Start a deferred payment mock that also returns a Payment-Receipt header.
-    pub async fn start_payment_deferred_with_receipt(
-        success_body: &str,
-        receipt_header: &str,
-    ) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(String::new());
-        let watch_tx = std::sync::Arc::new(watch_tx);
-        let owned_body = success_body.to_string();
-        let owned_receipt = receipt_header.to_string();
-
-        let app = Router::new().route(
-            "/{*path}",
-            any(move |headers: axum::http::HeaderMap| {
-                let rx = watch_rx.clone();
-                let b = owned_body.clone();
-                let r = owned_receipt.clone();
-                async move {
-                    if headers.get("authorization").is_some() {
-                        let mut resp = (StatusCode::OK, b).into_response();
-                        resp.headers_mut().insert(
-                            axum::http::HeaderName::from_static("payment-receipt"),
-                            axum::http::HeaderValue::from_str(&r).unwrap(),
-                        );
-                        resp
-                    } else {
-                        let h = rx.borrow().clone();
-                        let mut response =
-                            (StatusCode::PAYMENT_REQUIRED, "Payment Required").into_response();
-                        response.headers_mut().insert(
-                            axum::http::HeaderName::from_static("www-authenticate"),
-                            axum::http::HeaderValue::from_str(&h).unwrap(),
-                        );
-                        response
-                    }
-                }
-            }),
-        );
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        Self {
-            base_url,
-            shutdown_tx: Some(shutdown_tx),
-            _handle: handle,
-            www_auth_tx: Some(watch_tx),
         }
     }
 
     /// Start a mock that echoes request headers back as a JSON body.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_echo_headers() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -381,7 +180,7 @@ impl MockServer {
             "/{*path}",
             any(move |headers: axum::http::HeaderMap| async move {
                 let mut map = serde_json::Map::new();
-                for (k, v) in &headers {
+                for (k, v) in headers.iter() {
                     if let Ok(s) = v.to_str() {
                         map.insert(
                             k.as_str().to_string(),
@@ -404,20 +203,15 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
         }
     }
 
     /// Start a mock that echoes back the full request as JSON:
     /// `{ "method": "...", "path": "...", "query": "...", "headers": {...}, "body": "..." }`
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_echo_request() -> Self {
         use axum::http::Request;
 
@@ -432,7 +226,7 @@ impl MockServer {
                 let path = req.uri().path().to_string();
                 let query = req.uri().query().unwrap_or("").to_string();
                 let mut hdr_map = serde_json::Map::new();
-                for (k, v) in req.headers() {
+                for (k, v) in req.headers().iter() {
                     if let Ok(s) = v.to_str() {
                         hdr_map.insert(
                             k.as_str().to_string(),
@@ -465,19 +259,14 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
         }
     }
 
     /// Start a mock that returns an SSE stream with the given raw body.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_sse(body: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -510,16 +299,14 @@ impl MockServer {
                 .unwrap();
         });
 
-        Self {
+        MockServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
-            www_auth_tx: None,
         }
     }
 
     /// Get the full URL for a path on this server.
-    #[must_use]
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -544,10 +331,6 @@ pub struct MockRpcServer {
 
 impl MockRpcServer {
     /// Start a mock RPC server for the given chain ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start(chain_id: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -583,7 +366,7 @@ impl MockRpcServer {
                 .unwrap();
         });
 
-        Self {
+        MockRpcServer {
             base_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,
@@ -600,7 +383,6 @@ impl Drop for MockRpcServer {
 }
 
 /// Generate a mock JSON-RPC response for a given method.
-#[must_use]
 pub fn mock_rpc_response(req: &serde_json::Value, chain_id: u64) -> serde_json::Value {
     let method = req["method"].as_str().unwrap_or("");
     let id = req["id"].clone();
@@ -680,10 +462,6 @@ impl MockServicesServer {
     }
 
     /// Start a mock services directory with a custom payload.
-    ///
-    /// # Panics
-    ///
-    /// Panics when binding or running the mock server fails.
     pub async fn start_with_payload(payload: serde_json::Value) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -707,7 +485,7 @@ impl MockServicesServer {
                 .unwrap();
         });
 
-        Self {
+        MockServicesServer {
             services_url,
             shutdown_tx: Some(shutdown_tx),
             _handle: handle,

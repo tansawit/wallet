@@ -1,25 +1,12 @@
 //! Integration tests for tempo-wallet commands.
 
 mod common;
-mod session;
 
-use common::test_command;
-use tempo_test::{
-    assert_exit_code, get_combined_output, MockServicesServer, TestConfigBuilder,
-    MODERATO_DIRECT_KEYS_TOML,
+use common::{
+    assert_exit_code, get_combined_output, seed_local_session, test_command, MockServicesServer,
+    TestConfigBuilder, MODERATO_DIRECT_KEYS_TOML,
 };
 
-fn parse_events_log(path: &std::path::Path) -> Vec<(String, serde_json::Value)> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    content
-        .lines()
-        .filter_map(|line| {
-            let (name, json_str) = line.split_once('|')?;
-            let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
-            Some((name.to_string(), value))
-        })
-        .collect()
-}
 // ==================== whoami ====================
 
 #[test]
@@ -87,33 +74,94 @@ fn whoami_with_wallet_toon_shape() {
     );
 }
 
-#[test]
-fn whoami_emits_keystore_degraded_event_for_malformed_keys_file() {
-    let temp = TestConfigBuilder::new().build();
-    let keys_path = temp.path().join(".tempo/wallet/keys.toml");
-    std::fs::write(&keys_path, "this-is-not-valid-toml = [").unwrap();
+// ==================== list ====================
 
-    let events_path = temp.path().join("events_keystore_degraded.log");
-    let output = test_command(&temp)
-        .env("TEMPO_TEST_EVENTS", events_path.to_str().unwrap())
-        .arg("whoami")
-        .output()
-        .unwrap();
+#[test]
+fn list_empty_shows_no_wallets() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp).arg("list").output().unwrap();
 
     assert!(output.status.success());
-    let events = parse_events_log(&events_path);
-    let payload = events
-        .iter()
-        .find(|(name, _)| name == "keystore load degraded")
-        .map_or_else(
-            || panic!("missing keystore load degraded event: {events:?}"),
-            |(_, payload)| payload,
-        );
-
+    let combined = get_combined_output(&output);
     assert!(
-        payload["strict_parse_failures"].as_u64().unwrap_or(0) >= 1,
-        "expected strict_parse_failures >= 1, got: {payload}"
+        combined.contains("No wallets") || combined.contains("0 wallet"),
+        "should mention no wallets: {combined}"
     );
+}
+
+#[test]
+fn list_empty_json_shape() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp).args(["-j", "list"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["wallets"].is_array());
+    assert_eq!(parsed["total"], 0);
+}
+
+#[test]
+fn list_with_wallet_json_shape() {
+    let temp = TestConfigBuilder::new()
+        .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
+        .build();
+
+    let output = test_command(&temp).args(["-j", "list"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["wallets"].is_array());
+    assert!(parsed["total"].as_u64().unwrap() >= 1);
+    let wallet = &parsed["wallets"][0];
+    assert!(wallet["address"].is_string());
+    assert!(wallet["wallet_type"].is_string());
+}
+
+#[test]
+fn list_with_wallet_toon_shape() {
+    let temp = TestConfigBuilder::new()
+        .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
+        .build();
+
+    let output = test_command(&temp).args(["-t", "list"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = toon_format::decode_default(stdout.trim()).unwrap();
+    assert!(parsed["wallets"].is_array());
+    assert!(parsed["total"].as_u64().unwrap() >= 1);
+}
+
+// ==================== create ====================
+
+/// `create` requires OS keychain access (macOS Keychain / Linux secret-service),
+/// which is only available in interactive sessions. This test verifies the
+/// command is wired correctly by checking it produces an actionable error
+/// when keychain access fails, or succeeds when it's available.
+#[test]
+fn create_runs_without_panic() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp).arg("create").output().unwrap();
+
+    let combined = get_combined_output(&output);
+    if output.status.success() {
+        // Keychain was accessible — verify keys.toml was created
+        let keys_path = temp.path().join(".tempo/wallet/keys.toml");
+        assert!(keys_path.exists(), "keys.toml should be created");
+        let keys_content = std::fs::read_to_string(&keys_path).unwrap();
+        assert!(
+            keys_content.contains("wallet_address"),
+            "keys.toml should contain wallet_address: {keys_content}"
+        );
+    } else {
+        // Keychain not accessible — should produce a clear error, not a panic
+        assert!(
+            combined.contains("Keychain") || combined.contains("keychain"),
+            "should mention keychain error: {combined}"
+        );
+    }
 }
 
 // ==================== logout ====================
@@ -149,52 +197,12 @@ fn logout_no_wallet_json_shape() {
     assert_eq!(parsed["disconnected"], false);
 }
 
-#[test]
-fn logout_without_yes_in_non_interactive_mode_requires_confirmation_flag() {
-    use std::process::Stdio;
-
-    let passkey_keys = r#"
-[[keys]]
-wallet_type = "passkey"
-wallet_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-key_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-chain_id = 42431
-"#;
-    let temp = TestConfigBuilder::new()
-        .with_keys_toml(passkey_keys)
-        .build();
-    let mut child = test_command(&temp)
-        .arg("logout")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn logout command");
-
-    drop(child.stdin.take());
-    let output = child
-        .wait_with_output()
-        .expect("failed to wait for logout command");
-
-    assert_exit_code(
-        &output,
-        2,
-        "non-interactive logout without --yes should exit with E_USAGE",
-    );
-    let combined = get_combined_output(&output);
-    assert!(
-        combined.contains("Use --yes for non-interactive mode"),
-        "expected non-interactive confirmation guidance: {combined}"
-    );
-}
-
-// ==================== keys ====================
+// ==================== keys list ====================
 
 #[test]
-fn keys_empty() {
+fn keys_list_empty() {
     let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp).arg("keys").output().unwrap();
+    let output = test_command(&temp).args(["keys", "list"]).output().unwrap();
 
     assert!(output.status.success());
     let combined = get_combined_output(&output);
@@ -205,12 +213,15 @@ fn keys_empty() {
 }
 
 #[test]
-fn keys_json_shape() {
+fn keys_list_json_shape() {
     let temp = TestConfigBuilder::new()
         .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
         .build();
 
-    let output = test_command(&temp).args(["-j", "keys"]).output().unwrap();
+    let output = test_command(&temp)
+        .args(["-j", "keys", "list"])
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -219,16 +230,18 @@ fn keys_json_shape() {
     assert!(parsed["total"].as_u64().unwrap() >= 1);
     let key = &parsed["keys"][0];
     assert!(key["address"].is_string());
-    assert!(key["key"].is_string(), "JSON should include private key");
 }
 
 #[test]
-fn keys_toon_shape() {
+fn keys_list_toon_shape() {
     let temp = TestConfigBuilder::new()
         .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
         .build();
 
-    let output = test_command(&temp).args(["-t", "keys"]).output().unwrap();
+    let output = test_command(&temp)
+        .args(["-t", "keys", "list"])
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -237,40 +250,100 @@ fn keys_toon_shape() {
     assert!(parsed["total"].as_u64().unwrap() >= 1);
 }
 
+// ==================== sessions ====================
+
 #[test]
-fn mixed_case_keys_are_canonicalized_in_output() {
-    let mixed_case_keys = r#"
-[[keys]]
-wallet_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-key_address = "0xF39fD6E51Aad88f6f4ce6AB8827279cfFFb92266"
-key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-chain_id = 42431
-"#;
-    let temp = TestConfigBuilder::new()
-        .with_keys_toml(mixed_case_keys)
-        .build();
+fn sessions_list_empty_json() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "list"])
+        .output()
+        .unwrap();
 
-    let whoami = test_command(&temp).args(["-j", "whoami"]).output().unwrap();
-    assert!(whoami.status.success());
-    let whoami_json: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&whoami.stdout).trim()).unwrap();
-    assert_eq!(
-        whoami_json["wallet"].as_str(),
-        Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
-    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["sessions"].is_array());
+    assert_eq!(parsed["total"], 0);
+}
 
-    let keys = test_command(&temp).args(["-j", "keys"]).output().unwrap();
-    assert!(keys.status.success());
-    let keys_json: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&keys.stdout).trim()).unwrap();
-    assert_eq!(
-        keys_json["keys"][0]["wallet_address"].as_str(),
-        Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
-    );
-    assert_eq!(
-        keys_json["keys"][0]["address"].as_str(),
-        Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
-    );
+#[test]
+fn sessions_list_with_session_json() {
+    let temp = TestConfigBuilder::new().build();
+    seed_local_session(&temp, "https://api.example.com");
+
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["total"].as_u64().unwrap() >= 1);
+    let session = &parsed["sessions"][0];
+    assert!(session["origin"].is_string());
+}
+
+#[test]
+fn sessions_list_state_all_json() {
+    let temp = TestConfigBuilder::new().build();
+    seed_local_session(&temp, "https://api.example.com");
+
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "list", "--state", "all"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["sessions"].is_array());
+}
+
+#[test]
+fn sessions_info_not_found_json() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "info", "https://nonexistent.example.com"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["total"], 0);
+}
+
+#[test]
+fn sessions_info_found_json() {
+    let temp = TestConfigBuilder::new().build();
+    seed_local_session(&temp, "https://api.example.com");
+
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "info", "https://api.example.com"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed["total"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn sessions_sync_empty_json() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp)
+        .args(["-j", "sessions", "sync"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["synced"], 0);
+    assert_eq!(parsed["removed"], 0);
 }
 
 // ==================== services ====================
@@ -283,7 +356,7 @@ async fn services_category_filter() {
     // Filter by existing category
     let output = test_command(&temp)
         .env("TEMPO_SERVICES_URL", &mock.services_url)
-        .args(["-j", "services", "--search", "ai"])
+        .args(["-j", "services", "--category", "ai"])
         .output()
         .unwrap();
 
@@ -295,14 +368,14 @@ async fn services_category_filter() {
     // Filter by non-existent category
     let output = test_command(&temp)
         .env("TEMPO_SERVICES_URL", &mock.services_url)
-        .args(["-j", "services", "--search", "nonexistent"])
+        .args(["-j", "services", "--category", "nonexistent"])
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(parsed.as_array().is_some_and(std::vec::Vec::is_empty));
+    assert!(parsed.as_array().is_some_and(|a| a.is_empty()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -332,7 +405,7 @@ async fn services_search_filter() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(parsed.as_array().is_some_and(std::vec::Vec::is_empty));
+    assert!(parsed.as_array().is_some_and(|a| a.is_empty()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -342,7 +415,7 @@ async fn services_info_not_found() {
 
     let output = test_command(&temp)
         .env("TEMPO_SERVICES_URL", &mock.services_url)
-        .args(["services", "nonexistent_service"])
+        .args(["services", "info", "nonexistent_service"])
         .output()
         .unwrap();
 
@@ -354,27 +427,146 @@ async fn services_info_not_found() {
     );
 }
 
+// ==================== sign ====================
+
+/// Valid charge challenge for Tempo mainnet (chainId 4217).
+const VALID_CHARGE_CHALLENGE: &str = r#"Payment id="test", realm="test", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiIweDIwYzAwMDAwMDAwMDAwMDAwMDAwMDAwMGI5NTM3ZDExYzYwZThiNTAiLCJtZXRob2REZXRhaWxzIjp7ImNoYWluSWQiOjQyMTd9fQ""#;
+
 #[test]
-fn services_invalid_url_is_classified_as_usage_error() {
+fn sign_help_shows_flags() {
+    let temp = TestConfigBuilder::new().build();
+    let output = test_command(&temp)
+        .args(["sign", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let combined = get_combined_output(&output);
+    assert!(combined.contains("--challenge"), "should show --challenge");
+    assert!(combined.contains("--dry-run"), "should show --dry-run");
+}
+
+#[test]
+fn sign_dry_run_valid_challenge_succeeds() {
     let temp = TestConfigBuilder::new().build();
 
     let output = test_command(&temp)
-        .env("TEMPO_SERVICES_URL", "not-a-valid-url")
-        .args(["services", "list"])
+        .args(["sign", "--dry-run", "--challenge", VALID_CHARGE_CHALLENGE])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Challenge is valid"),
+        "should confirm valid challenge: {stderr}"
+    );
+}
+
+#[test]
+fn sign_dry_run_invalid_challenge_fails() {
+    let temp = TestConfigBuilder::new().build();
+
+    let output = test_command(&temp)
+        .args(["sign", "--dry-run", "--challenge", "not a valid challenge"])
         .output()
         .unwrap();
 
     assert!(!output.status.success());
-    assert_exit_code(
-        &output,
-        2,
-        "invalid TEMPO_SERVICES_URL should map to InvalidUsage",
-    );
+}
 
-    let combined = get_combined_output(&output);
+#[test]
+fn sign_dry_run_unsupported_method() {
+    let temp = TestConfigBuilder::new().build();
+    let challenge = r#"Payment id="x", realm="x", method="stripe", intent="charge", request="e30""#;
+
+    let output = test_command(&temp)
+        .args(["sign", "--dry-run", "--challenge", challenge])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        combined.contains("invalid service directory URL"),
-        "should report invalid service URL: {combined}"
+        stderr.contains("Unsupported"),
+        "should mention unsupported: {stderr}"
+    );
+}
+
+#[test]
+fn sign_dry_run_missing_chain_id() {
+    let temp = TestConfigBuilder::new().build();
+    // request = base64url({"amount":"1000","currency":"0x00"}) — no methodDetails/chainId
+    let challenge = r#"Payment id="x", realm="x", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiIweDAwIn0""#;
+
+    let output = test_command(&temp)
+        .args(["sign", "--dry-run", "--challenge", challenge])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("chainId"),
+        "should mention chainId: {stderr}"
+    );
+}
+
+#[test]
+fn sign_no_wallet_configured() {
+    let temp = TestConfigBuilder::new().build();
+
+    let output = test_command(&temp)
+        .args(["sign", "--challenge", VALID_CHARGE_CHALLENGE])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+}
+
+#[test]
+fn sign_empty_stdin_fails() {
+    use std::process::Stdio;
+
+    let temp = TestConfigBuilder::new().build();
+    let mut child = test_command(&temp)
+        .arg("sign")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+    drop(child.stdin.take()); // close stdin immediately
+    let output = child.wait_with_output().expect("Failed to wait");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn sign_dry_run_reads_from_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let temp = TestConfigBuilder::new().build();
+    let mut child = test_command(&temp)
+        .args(["sign", "--dry-run"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(VALID_CHARGE_CHALLENGE.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("Failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sign via stdin failed: {stderr}");
+    assert!(
+        stderr.contains("Challenge is valid"),
+        "should confirm valid: {stderr}"
     );
 }
 
@@ -390,156 +582,6 @@ fn version_flag_outputs_version() {
     assert!(
         combined.contains("tempo wallet"),
         "should show version: {combined}"
-    );
-}
-
-// ==================== transfer ====================
-
-#[test]
-fn transfer_help_shows_flags() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp)
-        .args(["transfer", "--help"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let combined = get_combined_output(&output);
-    assert!(combined.contains("<TO>"), "should show TO positional arg");
-    assert!(combined.contains("--dry-run"), "should show --dry-run flag");
-    assert!(
-        combined.contains("--fee-token"),
-        "should show --fee-token flag"
-    );
-    assert!(
-        combined.contains("Token contract address"),
-        "should describe token as contract address: {combined}"
-    );
-}
-
-#[test]
-fn transfer_no_wallet_fails() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp)
-        .args([
-            "transfer",
-            "1.00",
-            "0x20c0000000000000000000000b9537d11c60e8b50",
-            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let combined = get_combined_output(&output);
-    assert!(
-        combined.contains("No wallet") || combined.contains("login"),
-        "should mention no wallet or login: {combined}"
-    );
-}
-
-#[test]
-fn transfer_no_wallet_json_fails() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp)
-        .args([
-            "-j",
-            "transfer",
-            "1.00",
-            "0x20c0000000000000000000000b9537d11c60e8b50",
-            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-}
-
-#[test]
-fn transfer_missing_recipient_fails() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp)
-        .args([
-            "transfer",
-            "1.00",
-            "0x20c0000000000000000000000b9537d11c60e8b50",
-        ])
-        .output()
-        .unwrap();
-
-    assert_exit_code(&output, 2, "missing recipient should exit with E_USAGE");
-}
-
-#[test]
-fn transfer_missing_amount_fails() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp).args(["transfer"]).output().unwrap();
-
-    assert_exit_code(&output, 2, "missing amount should exit with E_USAGE");
-}
-
-#[test]
-fn transfer_missing_token_fails() {
-    let temp = TestConfigBuilder::new().build();
-    let output = test_command(&temp)
-        .args(["transfer", "1.00"])
-        .output()
-        .unwrap();
-
-    assert_exit_code(&output, 2, "missing token should exit with E_USAGE");
-}
-
-#[test]
-fn transfer_invalid_token_address_fails() {
-    let temp = TestConfigBuilder::new()
-        .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
-        .build();
-
-    let output = test_command(&temp)
-        .args([
-            "-n",
-            "tempo-moderato",
-            "transfer",
-            "1.00",
-            "not-an-address",
-            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let combined = get_combined_output(&output);
-    assert!(
-        combined.contains("token address"),
-        "should mention token address error: {combined}"
-    );
-}
-
-#[test]
-fn transfer_invalid_recipient_address_fails() {
-    let temp = TestConfigBuilder::new()
-        .with_keys_toml(MODERATO_DIRECT_KEYS_TOML)
-        .build();
-
-    // Use a non-0x string for recipient to trigger the validate_hex_input error
-    // before any on-chain calls happen
-    let output = test_command(&temp)
-        .args([
-            "-n",
-            "tempo-moderato",
-            "transfer",
-            "1.00",
-            "0x0000000000000000000000000000000000000001",
-            "not-an-address",
-        ])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let combined = get_combined_output(&output);
-    assert!(
-        combined.contains("recipient address"),
-        "should mention recipient address error: {combined}"
     );
 }
 

@@ -1,12 +1,9 @@
 [package]
 name = "tempo-test"
-version.workspace = true
+version = "0.1.0"
 edition = "2021"
 description = "Shared test utilities for Tempo CLI integration tests"
 publish = false
-
-[lints]
-workspace = true
 
 [dependencies]
 assert_cmd.workspace = true
