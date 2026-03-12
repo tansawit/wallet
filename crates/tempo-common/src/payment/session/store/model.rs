@@ -1,36 +1,14 @@
-//! Domain model and helpers for persisted channel records.
+//! Domain model and helpers for session records.
 
-use alloy::primitives::{Address, B256};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::network::NetworkId;
 
-/// Error returned when decoding a channel status from persisted storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct InvalidChannelStatusError {
-    value: String,
-}
-
-impl InvalidChannelStatusError {
-    fn new(value: &str) -> Self {
-        Self {
-            value: value.to_string(),
-        }
-    }
-}
-
-impl std::fmt::Display for InvalidChannelStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid channel status '{}'", self.value)
-    }
-}
-
-impl std::error::Error for InvalidChannelStatusError {}
-
-/// Channel lifecycle state.
+/// Session lifecycle state.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum ChannelStatus {
+pub enum SessionStatus {
     #[default]
     Active,
     Closing,
@@ -39,9 +17,8 @@ pub enum ChannelStatus {
     Orphaned,
 }
 
-impl ChannelStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
+impl SessionStatus {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Closing => "closing",
@@ -51,44 +28,41 @@ impl ChannelStatus {
         }
     }
 
-    pub(super) fn try_from_db_str(value: &str) -> Result<Self, InvalidChannelStatusError> {
+    pub(super) fn from_db_str(value: &str) -> Self {
         match value {
-            "active" => Ok(Self::Active),
-            "closing" => Ok(Self::Closing),
-            "finalizable" => Ok(Self::Finalizable),
-            "finalized" => Ok(Self::Finalized),
-            "orphaned" => Ok(Self::Orphaned),
-            _ => Err(InvalidChannelStatusError::new(value)),
+            "active" => Self::Active,
+            "closing" => Self::Closing,
+            "finalizable" => Self::Finalizable,
+            "finalized" => Self::Finalized,
+            "orphaned" => Self::Orphaned,
+            _ => Self::Active,
         }
     }
 }
 
-/// A persisted payment channel record.
+/// A persisted payment channel session.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ChannelRecord {
+pub struct SessionRecord {
     #[serde(default = "default_version")]
     pub version: u32,
     pub origin: String,
     #[serde(default)]
     pub request_url: String,
     pub chain_id: u64,
-    pub escrow_contract: Address,
-    pub token: String,
-    pub payee: String,
+    pub escrow_contract: String,
+    pub currency: String,
+    pub recipient: String,
     pub payer: String,
-    pub authorized_signer: Address,
+    pub authorized_signer: String,
     pub salt: String,
-    pub channel_id: B256,
-    pub deposit: u128,
-    pub cumulative_amount: u128,
-    /// Server-confirmed accepted cumulative amount. Used for cooperative close
-    /// to avoid overcharging. Defaults to `cumulative_amount` when unknown.
-    #[serde(default)]
-    pub accepted_cumulative: u128,
+    pub channel_id: String,
+    pub deposit: String,
+    pub tick_cost: String,
+    pub cumulative_amount: String,
     pub challenge_echo: String,
     /// Explicit lifecycle state.
     #[serde(default = "default_state")]
-    pub state: ChannelStatus,
+    pub state: SessionStatus,
     /// UNIX time when close was requested (0 if not requested)
     #[serde(default)]
     pub close_requested_at: u64,
@@ -99,15 +73,14 @@ pub struct ChannelRecord {
     pub last_used_at: u64,
 }
 
-const fn default_version() -> u32 {
+fn default_version() -> u32 {
     1
 }
 
-const fn default_state() -> ChannelStatus {
-    ChannelStatus::Active
+fn default_state() -> SessionStatus {
+    SessionStatus::Active
 }
 
-#[must_use]
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -115,50 +88,32 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-impl ChannelRecord {
+impl SessionRecord {
     /// Parse the cumulative amount.
-    #[must_use]
-    pub const fn cumulative_amount_u128(&self) -> u128 {
+    pub fn cumulative_amount_u128(&self) -> anyhow::Result<u128> {
         self.cumulative_amount
+            .parse()
+            .context("Invalid cumulative_amount in session record")
     }
 
     /// Parse the deposit amount.
-    #[must_use]
-    pub const fn deposit_u128(&self) -> u128 {
+    pub fn deposit_u128(&self) -> anyhow::Result<u128> {
         self.deposit
+            .parse()
+            .context("Invalid deposit in session record")
     }
 
     /// Parse the channel ID.
-    #[must_use]
-    pub const fn channel_id_b256(&self) -> B256 {
+    pub fn channel_id_b256(&self) -> anyhow::Result<alloy::primitives::B256> {
         self.channel_id
-    }
-
-    /// Canonical lowercase hex representation of channel ID.
-    #[must_use]
-    pub fn channel_id_hex(&self) -> String {
-        format!("{channel_id:#x}", channel_id = self.channel_id)
-    }
-
-    /// The server-confirmed accepted amount, for use in cooperative close.
-    /// Falls back to `cumulative_amount` when the accepted amount is unknown (zero).
-    #[must_use]
-    pub const fn accepted_cumulative_u128(&self) -> u128 {
-        if self.accepted_cumulative > 0 {
-            self.accepted_cumulative
-        } else {
-            self.cumulative_amount
-        }
+            .parse()
+            .context("Invalid channel_id in session record")
     }
 
     /// Update the cumulative amount (monotonic: never decreases).
     pub fn set_cumulative_amount(&mut self, amount: u128) {
-        self.cumulative_amount = amount.max(self.cumulative_amount);
-    }
-
-    /// Update the accepted cumulative amount (monotonic: never decreases).
-    pub fn set_accepted_cumulative(&mut self, amount: u128) {
-        self.accepted_cumulative = amount.max(self.accepted_cumulative);
+        let current = self.cumulative_amount.parse::<u128>().unwrap_or(0);
+        self.cumulative_amount = amount.max(current).to_string();
     }
 
     /// Update `last_used_at` timestamp.
@@ -167,59 +122,41 @@ impl ChannelRecord {
     }
 
     /// Derive the network from `chain_id`.
-    #[must_use]
     pub fn network_id(&self) -> NetworkId {
         NetworkId::from_chain_id(self.chain_id).unwrap_or_default()
     }
 
-    /// Validate and canonicalize persisted string identity fields.
-    ///
-    /// Returns `false` when `token` or `payee` is not a valid address.
-    pub fn normalize_persisted_identity(&mut self) -> bool {
-        let Ok(token) = self.token.parse::<Address>() else {
-            return false;
-        };
-        let Ok(payee) = self.payee.parse::<Address>() else {
-            return false;
-        };
-
-        self.token = format!("{token:#x}");
-        self.payee = format!("{payee:#x}");
-        true
-    }
-
-    /// Compute the display status and optional remaining seconds from channel state.
+    /// Compute the display status and optional remaining seconds from the session state.
     ///
     /// Returns `(status, remaining_secs)`:
-    /// - Active channels: `(ChannelStatus::Active, None)`
-    /// - Closing with time remaining: `(ChannelStatus::Closing, Some(secs))`
-    /// - Closing with grace elapsed: `(ChannelStatus::Finalizable, Some(0))`
-    #[must_use]
-    pub const fn status_at(&self, now: u64) -> (ChannelStatus, Option<u64>) {
+    /// - Active sessions: `(SessionStatus::Active, None)`
+    /// - Closing with time remaining: `(SessionStatus::Closing, Some(secs))`
+    /// - Closing with grace elapsed: `(SessionStatus::Finalizable, Some(0))`
+    pub fn status_at(&self, now: u64) -> (SessionStatus, Option<u64>) {
         match self.state {
-            ChannelStatus::Closing => {
+            SessionStatus::Closing => {
                 let rem = self.grace_ready_at.saturating_sub(now);
                 if rem == 0 && self.grace_ready_at > 0 {
-                    (ChannelStatus::Finalizable, Some(0))
+                    (SessionStatus::Finalizable, Some(0))
                 } else {
-                    (ChannelStatus::Closing, Some(rem))
+                    (SessionStatus::Closing, Some(rem))
                 }
             }
-            ChannelStatus::Finalizable => (ChannelStatus::Finalizable, Some(0)),
-            ChannelStatus::Finalized => (ChannelStatus::Finalized, None),
-            ChannelStatus::Orphaned => (ChannelStatus::Orphaned, None),
-            ChannelStatus::Active => (ChannelStatus::Active, None),
+            SessionStatus::Finalizable => (SessionStatus::Finalizable, Some(0)),
+            SessionStatus::Finalized => (SessionStatus::Finalized, None),
+            SessionStatus::Orphaned => (SessionStatus::Orphaned, None),
+            SessionStatus::Active => (SessionStatus::Active, None),
         }
     }
 }
 
-/// Compute an origin lock key from the origin URL (extract `scheme://host[:port]`).
+/// Compute a session key from the origin URL (extract `scheme://host[:port]`).
 ///
 /// Non-alphanumeric chars (except `-` and `.`) are replaced with `_`.
-#[must_use]
 pub fn session_key(origin: &str) -> String {
     let normalized = url::Url::parse(origin)
-        .map_or_else(|_| origin.to_string(), |u| u.origin().ascii_serialization());
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| origin.to_string());
 
     normalized
         .chars()
@@ -237,25 +174,25 @@ pub fn session_key(origin: &str) -> String {
 mod tests {
     use super::*;
 
-    fn test_record(origin: &str, salt: &str) -> ChannelRecord {
+    fn test_record(origin: &str, salt: &str) -> SessionRecord {
         let now = now_secs();
-        ChannelRecord {
+        SessionRecord {
             version: 1,
             origin: origin.into(),
             request_url: format!("{origin}/api/v1"),
             chain_id: 4217,
-            escrow_contract: Address::ZERO,
-            token: "0x00".into(),
-            payee: "0x00".into(),
+            escrow_contract: "0x00".into(),
+            currency: "0x00".into(),
+            recipient: "0x00".into(),
             payer: "0x00".into(),
-            authorized_signer: Address::ZERO,
+            authorized_signer: "0x00".into(),
             salt: salt.into(),
-            channel_id: B256::ZERO,
-            deposit: 1_000_000,
-            cumulative_amount: 0,
-            accepted_cumulative: 0,
+            channel_id: "0x00".into(),
+            deposit: "1000000".into(),
+            tick_cost: "100".into(),
+            cumulative_amount: "0".into(),
             challenge_echo: "echo".into(),
-            state: ChannelStatus::Active,
+            state: SessionStatus::Active,
             close_requested_at: 0,
             grace_ready_at: 0,
             created_at: now,
@@ -275,54 +212,54 @@ mod tests {
     fn test_status_at_active() {
         let record = test_record("https://example.com", "salt");
         let (status, rem) = record.status_at(1000);
-        assert_eq!(status, ChannelStatus::Active);
+        assert_eq!(status, SessionStatus::Active);
         assert!(rem.is_none());
     }
 
     #[test]
     fn test_status_at_closing_with_remaining() {
         let mut record = test_record("https://example.com", "salt");
-        record.state = ChannelStatus::Closing;
+        record.state = SessionStatus::Closing;
         record.grace_ready_at = 2000;
         let (status, rem) = record.status_at(1500);
-        assert_eq!(status, ChannelStatus::Closing);
+        assert_eq!(status, SessionStatus::Closing);
         assert_eq!(rem, Some(500));
     }
 
     #[test]
     fn test_status_at_closing_grace_elapsed() {
         let mut record = test_record("https://example.com", "salt");
-        record.state = ChannelStatus::Closing;
+        record.state = SessionStatus::Closing;
         record.grace_ready_at = 1000;
         let (status, rem) = record.status_at(2000);
-        assert_eq!(status, ChannelStatus::Finalizable);
+        assert_eq!(status, SessionStatus::Finalizable);
         assert_eq!(rem, Some(0));
     }
 
     #[test]
     fn test_status_at_finalizable() {
         let mut record = test_record("https://example.com", "salt");
-        record.state = ChannelStatus::Finalizable;
+        record.state = SessionStatus::Finalizable;
         let (status, rem) = record.status_at(5000);
-        assert_eq!(status, ChannelStatus::Finalizable);
+        assert_eq!(status, SessionStatus::Finalizable);
         assert_eq!(rem, Some(0));
     }
 
     #[test]
     fn test_status_at_finalized() {
         let mut record = test_record("https://example.com", "salt");
-        record.state = ChannelStatus::Finalized;
+        record.state = SessionStatus::Finalized;
         let (status, rem) = record.status_at(1000);
-        assert_eq!(status, ChannelStatus::Finalized);
+        assert_eq!(status, SessionStatus::Finalized);
         assert!(rem.is_none());
     }
 
     #[test]
     fn test_status_at_orphaned() {
         let mut record = test_record("https://example.com", "salt");
-        record.state = ChannelStatus::Orphaned;
+        record.state = SessionStatus::Orphaned;
         let (status, rem) = record.status_at(1000);
-        assert_eq!(status, ChannelStatus::Orphaned);
+        assert_eq!(status, SessionStatus::Orphaned);
         assert!(rem.is_none());
     }
 
@@ -343,90 +280,70 @@ mod tests {
     #[test]
     fn test_cumulative_amount_u128_valid() {
         let mut record = test_record("https://example.com", "salt");
-        record.cumulative_amount = 1000;
-        assert_eq!(record.cumulative_amount_u128(), 1000u128);
+        record.cumulative_amount = "1000".into();
+        assert_eq!(record.cumulative_amount_u128().unwrap(), 1000u128);
     }
 
     #[test]
-    fn test_set_cumulative_amount_monotonic() {
+    fn test_cumulative_amount_u128_invalid() {
         let mut record = test_record("https://example.com", "salt");
-        record.cumulative_amount = 50;
-        record.set_cumulative_amount(10);
-        assert_eq!(record.cumulative_amount, 50);
-        record.set_cumulative_amount(100);
-        assert_eq!(record.cumulative_amount, 100);
+        record.cumulative_amount = "abc".into();
+        assert!(record.cumulative_amount_u128().is_err());
     }
 
     #[test]
     fn test_deposit_u128_valid() {
         let mut record = test_record("https://example.com", "salt");
-        record.deposit = 5_000_000;
-        assert_eq!(record.deposit_u128(), 5_000_000_u128);
+        record.deposit = "5000000".into();
+        assert_eq!(record.deposit_u128().unwrap(), 5000000u128);
     }
 
     #[test]
-    fn test_channel_id_hex() {
+    fn test_deposit_u128_invalid() {
         let mut record = test_record("https://example.com", "salt");
-        record.channel_id = B256::from(alloy::primitives::U256::from(1));
-        assert_eq!(
-            record.channel_id_hex(),
-            "0x0000000000000000000000000000000000000000000000000000000000000001"
-        );
+        record.deposit = "".into();
+        assert!(record.deposit_u128().is_err());
     }
 
     #[test]
     fn test_channel_id_b256_valid() {
         let mut record = test_record("https://example.com", "salt");
-        record.channel_id = B256::from(alloy::primitives::U256::from(1));
-        let b = record.channel_id_b256();
-        assert_eq!(b, B256::from(alloy::primitives::U256::from(1)));
+        record.channel_id =
+            "0x0000000000000000000000000000000000000000000000000000000000000001".into();
+        let b = record.channel_id_b256().unwrap();
+        assert_eq!(
+            b,
+            alloy::primitives::B256::from(alloy::primitives::U256::from(1))
+        );
     }
 
     #[test]
-    fn test_channel_status_round_trip() {
+    fn test_channel_id_b256_invalid() {
+        let mut record = test_record("https://example.com", "salt");
+        record.channel_id = "not_hex".into();
+        assert!(record.channel_id_b256().is_err());
+    }
+
+    #[test]
+    fn test_session_status_round_trip() {
         let variants = [
-            ChannelStatus::Active,
-            ChannelStatus::Closing,
-            ChannelStatus::Finalizable,
-            ChannelStatus::Finalized,
-            ChannelStatus::Orphaned,
+            SessionStatus::Active,
+            SessionStatus::Closing,
+            SessionStatus::Finalizable,
+            SessionStatus::Finalized,
+            SessionStatus::Orphaned,
         ];
         for variant in variants {
             let s = variant.as_str();
-            let parsed = ChannelStatus::try_from_db_str(s).unwrap();
+            let parsed = SessionStatus::from_db_str(s);
             assert_eq!(parsed, variant, "round-trip failed for {s}");
         }
     }
 
     #[test]
-    fn test_channel_status_unknown_is_error() {
-        let err = ChannelStatus::try_from_db_str("garbage").unwrap_err();
-        assert_eq!(err.to_string(), "invalid channel status 'garbage'");
-
-        let err = ChannelStatus::try_from_db_str("").unwrap_err();
-        assert_eq!(err.to_string(), "invalid channel status ''");
-    }
-
-    #[test]
-    fn test_normalize_persisted_identity_canonicalizes_addresses() {
-        let mut record = test_record("https://example.com", "salt");
-        record.token = "0x20C000000000000000000000B9537D11C60E8B50".into();
-        record.payee = "0x111111111111111111111111111111111111AbCd".into();
-
-        assert!(record.normalize_persisted_identity());
-        assert_eq!(record.token, "0x20c000000000000000000000b9537d11c60e8b50");
-        assert_eq!(record.payee, "0x111111111111111111111111111111111111abcd");
-    }
-
-    #[test]
-    fn test_normalize_persisted_identity_rejects_invalid_addresses() {
-        let mut record = test_record("https://example.com", "salt");
-        record.token = "bad-token".into();
-        assert!(!record.normalize_persisted_identity());
-
-        let mut record = test_record("https://example.com", "salt");
-        record.payee = "bad-payee".into();
-        assert!(!record.normalize_persisted_identity());
+    fn test_session_status_unknown_defaults_to_active() {
+        assert_eq!(SessionStatus::from_db_str("garbage"), SessionStatus::Active);
+        assert_eq!(SessionStatus::from_db_str(""), SessionStatus::Active);
     }
 
     #[test]

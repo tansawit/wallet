@@ -1,23 +1,20 @@
 //! CLI → domain conversion: URL parsing, HTTP client construction, request planning.
 
+use anyhow::Result;
 use base64::Engine;
 
-use crate::{
-    args::QueryArgs,
-    http::{HttpClient, HttpRequestBody, HttpRequestPlan, DEFAULT_USER_AGENT},
-};
-use tempo_common::{
-    cli::context::Context,
-    error::{InputError, TempoError},
-    network::NetworkId,
-};
+use crate::args::QueryArgs;
+use crate::http::{HttpClient, HttpRequestPlan, DEFAULT_USER_AGENT};
+use tempo_common::cli::context::Context;
+use tempo_common::error::InputError;
+use tempo_common::network::NetworkId;
 
-use super::{
-    headers::{has_header, parse_headers, should_auto_add_json_content_type, validate_header_size},
-    payload::{
-        append_data_to_query, join_form_pairs, parse_data_urlencode, resolve_method_and_body,
-        resolve_multipart, validate_body_size,
-    },
+use super::headers::{
+    has_header, parse_headers, should_auto_add_json_content_type, validate_header_size,
+};
+use super::payload::{
+    append_data_to_query, join_form_pairs, parse_data_urlencode, resolve_method_and_body,
+    validate_body_size,
 };
 
 /// Default HTTP status codes considered transient/retryable (curl parity).
@@ -33,7 +30,7 @@ pub(crate) struct PreparedRequest {
 ///
 /// Handles URL parsing, `-G/--get` query-string appending, and client
 /// construction — everything needed before execution.
-pub(crate) fn prepare(ctx: &Context, query: &QueryArgs) -> Result<PreparedRequest, TempoError> {
+pub(crate) fn prepare(ctx: &Context, query: &QueryArgs) -> Result<PreparedRequest> {
     let mut url = parse_and_validate_url(&query.url)?;
 
     // Support -G/--get: append -d and --data-urlencode to query string and force GET if no explicit -X
@@ -46,11 +43,13 @@ pub(crate) fn prepare(ctx: &Context, query: &QueryArgs) -> Result<PreparedReques
 }
 
 /// Parse and validate a URL, ensuring it uses http or https.
-fn parse_and_validate_url(raw: &str) -> Result<url::Url, TempoError> {
-    let parsed = url::Url::parse(raw).map_err(InputError::UrlParse)?;
+fn parse_and_validate_url(raw: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(raw).map_err(|e| InputError::InvalidUrl(e.to_string()))?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(InputError::UnsupportedUrlScheme(scheme.to_string()).into());
+        anyhow::bail!(InputError::InvalidUrl(format!(
+            "unsupported scheme '{scheme}'"
+        )));
     }
     Ok(parsed)
 }
@@ -59,7 +58,7 @@ fn parse_and_validate_url(raw: &str) -> Result<url::Url, TempoError> {
 ///
 /// This is the boundary where CLI-specific types are converted into
 /// domain types used by the HTTP and payment layers.
-fn build_client(ctx: &Context, query: &QueryArgs) -> Result<HttpClient, TempoError> {
+fn build_client(ctx: &Context, query: &QueryArgs) -> Result<HttpClient> {
     let plan = build_request_plan(query)?;
 
     // Keep Option so payment dispatch can distinguish an explicit --network.
@@ -72,11 +71,13 @@ fn build_client(ctx: &Context, query: &QueryArgs) -> Result<HttpClient, TempoErr
 ///
 /// Resolves method, body, headers, retry policy, and timeouts into a
 /// ready-to-execute `HttpRequestPlan`.
-fn build_request_plan(query: &QueryArgs) -> Result<HttpRequestPlan, TempoError> {
+fn build_request_plan(query: &QueryArgs) -> Result<HttpRequestPlan> {
     for header in &query.headers {
         validate_header_size(header)?;
         if header.contains('\r') || header.contains('\n') {
-            return Err(InputError::HeaderContainsControlChars.into());
+            anyhow::bail!(InputError::InvalidHeader(
+                "header contains CR/LF characters".to_string()
+            ));
         }
     }
 
@@ -89,40 +90,22 @@ fn build_request_plan(query: &QueryArgs) -> Result<HttpRequestPlan, TempoError> 
     } else {
         query.method.as_deref()
     };
-
-    // Multipart form: -F/--form takes a separate path
-    let (method, body) = if !suppress_body && !query.form.is_empty() {
-        let (method, body) = resolve_multipart(method_override, &query.form)?;
-        (method, Some(body))
+    let (data, json, toon) = if suppress_body {
+        (&[][..], None, None)
     } else {
-        let (data, json, toon) = if suppress_body {
-            (&[][..], None, None)
-        } else {
-            (
-                query.data.as_slice(),
-                query.json.as_deref(),
-                query.toon.as_deref(),
-            )
-        };
-        let (method, body) = resolve_method_and_body(method_override, data, json, toon)?;
-        (method, body.map(HttpRequestBody::Bytes))
+        (
+            query.data.as_slice(),
+            query.json.as_deref(),
+            query.toon.as_deref(),
+        )
     };
+    let (method, body) = resolve_method_and_body(method_override, data, json, toon)?;
 
-    let data = if suppress_body {
-        &[][..]
-    } else {
-        query.data.as_slice()
-    };
     let headers = build_extra_headers(query, suppress_body, data);
 
     // If not using -G, merge --data-urlencode into body (form-encoded)
     let body = if !query.get && !query.data_urlencode.is_empty() {
-        let mut base = match body {
-            Some(HttpRequestBody::Bytes(b)) => b,
-            None => Vec::new(),
-            // clap conflicts_with prevents this, but guard defensively
-            Some(HttpRequestBody::Multipart(_)) => unreachable!(),
-        };
+        let mut base = body.unwrap_or_default();
         let enc_pairs = parse_data_urlencode(&query.data_urlencode)?;
         let form = join_form_pairs(&enc_pairs);
         if !base.is_empty() {
@@ -130,7 +113,7 @@ fn build_request_plan(query: &QueryArgs) -> Result<HttpRequestPlan, TempoError> 
         }
         base.extend_from_slice(form.as_bytes());
         validate_body_size(base.len())?;
-        Some(HttpRequestBody::Bytes(base))
+        Some(base)
     } else {
         body
     };
@@ -187,13 +170,13 @@ fn build_extra_headers(
     if let Some(ref user) = query.user {
         if !has_header(raw_headers, "authorization") {
             let encoded = base64::engine::general_purpose::STANDARD.encode(user);
-            headers.push(("authorization".to_string(), format!("Basic {encoded}")));
+            headers.push(("authorization".to_string(), format!("Basic {}", encoded)));
         }
     }
     // Add Authorization: Bearer if provided and not explicitly overridden
     if let Some(ref token) = query.bearer {
         if !has_header(raw_headers, "authorization") && query.user.is_none() {
-            headers.push(("authorization".to_string(), format!("Bearer {token}")));
+            headers.push(("authorization".to_string(), format!("Bearer {}", token)));
         }
     }
     // Add Referer header if provided and not overridden via -H

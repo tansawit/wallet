@@ -11,15 +11,15 @@ pub(crate) mod payload;
 pub(crate) mod prepare;
 pub(crate) mod sse;
 
-use crate::{
-    args::QueryArgs,
-    payment::{router::dispatch_payment, types::PaymentResult},
-};
-use tempo_common::{
-    cli::context::Context,
-    error::{NetworkError, TempoError},
-    security::redact_url,
-};
+use anyhow::Result;
+
+use crate::args::QueryArgs;
+use crate::payment::router::dispatch_payment;
+use crate::payment::types::PaymentResult;
+use tempo_common::cli::context::Context;
+use tempo_common::cli::output::emit_by_format;
+use tempo_common::error::{NetworkError, PaymentError};
+use tempo_common::security::redact_url;
 
 use self::output::{build_output_options, write_meta_if_requested};
 
@@ -32,10 +32,10 @@ use self::output::{build_output_options, write_meta_if_requested};
 /// 4. Ensure wallet is available (prompt login if needed)
 /// 5. Dispatch to charge or session payment flow
 /// 6. Display the final response
-pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoError> {
+pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<()> {
     // Offline mode: fail fast before any network I/O
     if query.offline {
-        return Err(NetworkError::OfflineMode.into());
+        anyhow::bail!(NetworkError::OfflineMode);
     }
 
     let prepared = prepare::prepare(ctx, &query)?;
@@ -83,7 +83,7 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
 
     if response.status_code != 402 {
         analytics::track_query_success(ctx, &sanitized_url, &method_str, response.status_code);
-        output::handle_response(&output_opts, response)?;
+        output::handle_response(&output_opts, response, None)?;
         return Ok(());
     }
 
@@ -98,6 +98,21 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
 
     let challenge = challenge::parse_payment_challenge(&response)?;
 
+    // Dry-run price output for agents
+    if prepared.http.dry_run && query.price_json {
+        let obj = serde_json::json!({
+            "intent": challenge.intent_str(),
+            "network": challenge.network.as_str(),
+            "amount": challenge.amount,
+            "currency": challenge.currency,
+        });
+        emit_by_format(output_opts.output_format, &obj, || {
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+            Ok(())
+        })?;
+        return Ok(());
+    }
+
     if prepared.http.log_enabled() {
         eprintln!(
             "Payment required: intent={} network={} amount={}",
@@ -105,6 +120,28 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
             challenge.network.as_str(),
             challenge.amount_display(),
         );
+    }
+
+    // Enforce client-side price cap if configured
+    if let Some(ref cur) = query.max_pay_currency {
+        let symbol = challenge.network.token().symbol;
+        let cur_lower = cur.to_lowercase();
+        if cur_lower != challenge.currency.to_lowercase() && cur_lower != symbol.to_lowercase() {
+            anyhow::bail!(PaymentError::PaymentRejected {
+                reason: "requested currency does not match client max-pay-currency".to_string(),
+                status_code: 402,
+            });
+        }
+    }
+    if let Some(max_val) = query.max_pay {
+        if let Ok(req_val) = challenge.amount.parse::<u128>() {
+            if req_val > max_val {
+                anyhow::bail!(PaymentError::PaymentRejected {
+                    reason: "price exceeds client max".to_string(),
+                    status_code: 402,
+                });
+            }
+        }
     }
 
     // Skip wallet login for dry-run or when a private key is provided directly
@@ -119,7 +156,6 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
 
     let pay_analytics = analytics::PaymentAnalytics::new(
         ctx,
-        &sanitized_url,
         challenge_network.as_str(),
         &challenge.amount,
         &challenge.currency,
@@ -135,17 +171,20 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
         challenge.challenge,
         challenge_network,
         &ctx.keys,
+        query.max_pay,
     )
     .await;
 
     match result {
         Ok(PaymentResult {
             tx_hash,
-            channel_id,
+            session_id,
             status_code,
             response,
         }) => {
-            pay_analytics.track_success(tx_hash, channel_id, &target_url, &method_str, status_code);
+            ctx.keys
+                .mark_provisioned(challenge_network, ctx.keys.wallet_address());
+            pay_analytics.track_success(tx_hash, session_id, &target_url, &method_str, status_code);
             if let Some(resp) = response {
                 // Display receipt summary for charge responses
                 if !is_session {
@@ -157,14 +196,13 @@ pub(crate) async fn run(ctx: &Context, query: QueryArgs) -> Result<(), TempoErro
                     );
                 }
 
-                output::handle_response(&output_opts, resp)?;
+                output::handle_response(&output_opts, resp, query.save_receipt.as_deref())?;
             }
             Ok(())
         }
         Err(e) => {
-            let err = e;
-            pay_analytics.track_failure(&err);
-            Err(err)
+            pay_analytics.track_failure(&e);
+            Err(e)
         }
     }
 }

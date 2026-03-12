@@ -1,42 +1,26 @@
 //! Header parsing, validation, and content-type detection for CLI inputs.
 
-use tempo_common::error::{InputError, TempoError};
+use anyhow::Result;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HeaderName(String);
-
-impl HeaderName {
-    fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase();
-        (!normalized.is_empty()).then_some(Self(normalized))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+use tempo_common::error::InputError;
 
 /// Maximum header size (8 KB)
 const MAX_HEADER_SIZE: usize = 8 * 1024;
 
 /// Reject a raw header string that exceeds the maximum allowed size.
-pub(crate) fn validate_header_size(header: &str) -> Result<(), TempoError> {
+pub(crate) fn validate_header_size(header: &str) -> Result<()> {
     if header.len() > MAX_HEADER_SIZE {
-        return Err(InputError::HeaderTooLarge(MAX_HEADER_SIZE).into());
+        anyhow::bail!(InputError::HeaderTooLarge(MAX_HEADER_SIZE));
     }
     Ok(())
 }
 
 /// Check if a header name exists in raw header strings (case-insensitive).
 pub(crate) fn has_header(headers: &[String], name: &str) -> bool {
-    let Some(target) = HeaderName::parse(name) else {
-        return false;
-    };
-
+    let name_lower = name.to_lowercase();
     headers.iter().any(|h| {
         h.split_once(':')
-            .and_then(|(k, _)| HeaderName::parse(k))
-            .is_some_and(|header_name| header_name == target)
+            .is_some_and(|(k, _)| k.trim().to_lowercase() == name_lower)
     })
 }
 
@@ -49,8 +33,7 @@ pub(crate) fn parse_headers(headers: &[String]) -> Vec<(String, String)> {
         .iter()
         .filter_map(|header| {
             let (key, value) = header.split_once(':')?;
-            let key = HeaderName::parse(key)?;
-            Some((key.as_str().to_string(), value.trim().to_string()))
+            Some((key.trim().to_lowercase(), value.trim().to_string()))
         })
         .collect()
 }

@@ -1,7 +1,8 @@
 //! Request body resolution and form encoding for query inputs.
 
-use crate::http::{HttpRequestBody, MultipartField};
-use tempo_common::error::{InputError, TempoError};
+use anyhow::{Context as _, Result};
+
+use tempo_common::error::InputError;
 
 /// Maximum request body size (100 MB)
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
@@ -14,13 +15,12 @@ pub(crate) fn append_data_to_query(
     url: &mut url::Url,
     data: &[String],
     data_urlencode: &[String],
-) -> Result<(), TempoError> {
+) -> Result<()> {
     // Raw -d data (verbatim, joined by '&')
     let mut raw = String::new();
     if !data.is_empty() {
         let combined = resolve_and_join_data(data)?;
-        raw =
-            String::from_utf8(combined).map_err(|source| InputError::GetDataNotUtf8 { source })?;
+        raw = String::from_utf8(combined).context("data is not valid UTF-8 for --get")?;
     }
     // Encoded data from --data-urlencode
     let enc_pairs = parse_data_urlencode(data_urlencode)?;
@@ -38,9 +38,9 @@ pub(crate) fn append_data_to_query(
     Ok(())
 }
 
-pub(crate) fn validate_body_size(len: usize) -> Result<(), TempoError> {
+pub(crate) fn validate_body_size(len: usize) -> Result<()> {
     if len > MAX_BODY_SIZE {
-        return Err(InputError::BodyTooLarge(MAX_BODY_SIZE).into());
+        anyhow::bail!(InputError::BodyTooLarge(MAX_BODY_SIZE));
     }
     Ok(())
 }
@@ -51,7 +51,7 @@ pub(crate) fn validate_body_size(len: usize) -> Result<(), TempoError> {
 /// - `@filename` — read the file as binary
 /// - `@-` — read stdin as binary
 /// - anything else — treat as a literal UTF-8 string
-fn resolve_data(data: &str) -> Result<Vec<u8>, TempoError> {
+fn resolve_data(data: &str) -> Result<Vec<u8>> {
     use std::io::Read;
 
     if let Some(path) = data.strip_prefix('@') {
@@ -78,7 +78,7 @@ fn resolve_data(data: &str) -> Result<Vec<u8>, TempoError> {
 }
 
 /// Resolve and join multiple `-d` data items with `&` separators.
-fn resolve_and_join_data(data: &[String]) -> Result<Vec<u8>, TempoError> {
+fn resolve_and_join_data(data: &[String]) -> Result<Vec<u8>> {
     let mut combined = Vec::new();
     for item in data {
         let bytes = resolve_data(item)?;
@@ -96,10 +96,10 @@ pub(crate) fn resolve_method_and_body(
     data: &[String],
     json: Option<&str>,
     toon: Option<&str>,
-) -> Result<(reqwest::Method, Option<Vec<u8>>), TempoError> {
+) -> Result<(reqwest::Method, Option<Vec<u8>>)> {
     let body = if let Some(toon_data) = toon {
-        let value: serde_json::Value =
-            toon_format::decode_default(toon_data).map_err(InputError::InvalidToonInput)?;
+        let value: serde_json::Value = toon_format::decode_default(toon_data)
+            .map_err(|e| anyhow::anyhow!("failed to decode TOON input: {e}"))?;
         Some(serde_json::to_string(&value)?.into_bytes())
     } else if let Some(json) = json {
         Some(json.as_bytes().to_vec())
@@ -115,7 +115,7 @@ pub(crate) fn resolve_method_and_body(
 
     let method = match method {
         Some(m) => reqwest::Method::from_bytes(m.to_uppercase().as_bytes())
-            .map_err(|_| InputError::InvalidMethod(m.to_owned()))?,
+            .map_err(|_| anyhow::anyhow!("invalid HTTP method: {m}"))?,
         None => {
             if body.is_some() {
                 reqwest::Method::POST
@@ -128,91 +128,8 @@ pub(crate) fn resolve_method_and_body(
     Ok((method, body))
 }
 
-/// Resolve `-F`/`--form` fields into a method and multipart body.
-///
-/// Supports curl-compatible syntax:
-/// - `name=value` — text field
-/// - `name=@file` — file field (read eagerly into memory)
-/// - `name=@file;type=mime` — file field with explicit MIME type
-pub(crate) fn resolve_multipart(
-    method: Option<&str>,
-    form_fields: &[String],
-) -> Result<(reqwest::Method, HttpRequestBody), TempoError> {
-    let mut fields = Vec::with_capacity(form_fields.len());
-    let mut total_size: usize = 0;
-
-    for spec in form_fields {
-        let Some((name, rest)) = spec.split_once('=') else {
-            return Err(
-                InputError::InvalidFormField(format!("missing '=' in form field: {spec}")).into(),
-            );
-        };
-        if name.is_empty() {
-            return Err(InputError::InvalidFormField(
-                "form field name cannot be empty".to_string(),
-            )
-            .into());
-        }
-
-        if let Some(file_spec) = rest.strip_prefix('@') {
-            // File field: name=@path or name=@path;type=mime
-            let (path, content_type) = if let Some((p, type_spec)) = file_spec.split_once(";type=")
-            {
-                (p, Some(type_spec.to_string()))
-            } else {
-                (file_spec, None)
-            };
-
-            if path.is_empty() {
-                return Err(InputError::InvalidFormField(format!(
-                    "missing file path in form field: {spec}"
-                ))
-                .into());
-            }
-
-            let bytes = std::fs::read(path).map_err(|e| InputError::ReadFile {
-                path: path.to_string(),
-                source: e,
-            })?;
-            total_size = total_size.saturating_add(bytes.len());
-            validate_body_size(total_size)?;
-
-            let filename = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path)
-                .to_string();
-
-            fields.push(MultipartField::File {
-                name: name.to_string(),
-                filename,
-                content_type,
-                bytes,
-            });
-        } else {
-            // Text field: name=value
-            total_size = total_size.saturating_add(rest.len());
-            validate_body_size(total_size)?;
-            fields.push(MultipartField::Text {
-                name: name.to_string(),
-                value: rest.to_string(),
-            });
-        }
-    }
-
-    let method = match method {
-        Some(m) => reqwest::Method::from_bytes(m.to_uppercase().as_bytes())
-            .map_err(|_| InputError::InvalidMethod(m.to_owned()))?,
-        None => reqwest::Method::POST,
-    };
-
-    Ok((method, HttpRequestBody::Multipart(fields)))
-}
-
 /// Parse --data-urlencode items into (name, value) tuples with URL-encoding applied.
-pub(crate) fn parse_data_urlencode(
-    items: &[String],
-) -> Result<Vec<(Option<String>, String)>, TempoError> {
+pub(crate) fn parse_data_urlencode(items: &[String]) -> Result<Vec<(Option<String>, String)>> {
     let mut pairs = Vec::new();
     for it in items {
         if let Some(rest) = it.strip_prefix('@') {
@@ -333,17 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_method_reports_typed_input_error() {
-        let result = resolve_method_and_body(Some("NOPE??"), &[], None, None);
-        assert!(result.is_err(), "expected error for invalid HTTP method");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("Invalid HTTP method"),
-            "error should mention invalid HTTP method, got: {msg}"
-        );
-    }
-
-    #[test]
     fn test_parse_data_urlencode_simple() {
         let items = vec!["key=hello world".to_string()];
         let result = parse_data_urlencode(&items).unwrap();
@@ -375,131 +281,5 @@ mod tests {
         let err = parse_data_urlencode(&items).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("failed to read file"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_multipart_text_field() {
-        let fields = vec!["name=hello".to_string()];
-        let (method, body) = resolve_multipart(None, &fields).unwrap();
-        assert_eq!(method, reqwest::Method::POST);
-        match body {
-            HttpRequestBody::Multipart(fields) => {
-                assert_eq!(fields.len(), 1);
-                match &fields[0] {
-                    MultipartField::Text { name, value } => {
-                        assert_eq!(name, "name");
-                        assert_eq!(value, "hello");
-                    }
-                    _ => panic!("expected text field"),
-                }
-            }
-            _ => panic!("expected multipart body"),
-        }
-    }
-
-    #[test]
-    fn test_multipart_implies_post() {
-        let fields = vec!["key=value".to_string()];
-        let (method, _body) = resolve_multipart(None, &fields).unwrap();
-        assert_eq!(method, reqwest::Method::POST);
-    }
-
-    #[test]
-    fn test_multipart_explicit_method_preserved() {
-        let fields = vec!["key=value".to_string()];
-        let (method, _body) = resolve_multipart(Some("PUT"), &fields).unwrap();
-        assert_eq!(method, reqwest::Method::PUT);
-    }
-
-    #[test]
-    fn test_multipart_missing_equals_error() {
-        let fields = vec!["no-equals-sign".to_string()];
-        let err = resolve_multipart(None, &fields).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("missing '='"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_multipart_empty_name_error() {
-        let fields = vec!["=value".to_string()];
-        let err = resolve_multipart(None, &fields).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("cannot be empty"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_multipart_file_not_found_error() {
-        let fields = vec!["file=@nonexistent_file_12345.txt".to_string()];
-        let err = resolve_multipart(None, &fields).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("failed to read file"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_multipart_file_field() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), b"file-content").unwrap();
-        let path = tmp.path().to_str().unwrap();
-        let fields = vec![format!("upload=@{path}")];
-        let (_method, body) = resolve_multipart(None, &fields).unwrap();
-        match body {
-            HttpRequestBody::Multipart(fields) => {
-                assert_eq!(fields.len(), 1);
-                match &fields[0] {
-                    MultipartField::File {
-                        name,
-                        filename,
-                        content_type,
-                        bytes,
-                    } => {
-                        assert_eq!(name, "upload");
-                        assert!(!filename.is_empty());
-                        assert!(content_type.is_none());
-                        assert_eq!(bytes, b"file-content");
-                    }
-                    _ => panic!("expected file field"),
-                }
-            }
-            _ => panic!("expected multipart body"),
-        }
-    }
-
-    #[test]
-    fn test_multipart_file_with_mime_type() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), b"data").unwrap();
-        let path = tmp.path().to_str().unwrap();
-        let fields = vec![format!("doc=@{path};type=text/plain")];
-        let (_method, body) = resolve_multipart(None, &fields).unwrap();
-        match body {
-            HttpRequestBody::Multipart(fields) => match &fields[0] {
-                MultipartField::File { content_type, .. } => {
-                    assert_eq!(content_type.as_deref(), Some("text/plain"));
-                }
-                _ => panic!("expected file field"),
-            },
-            _ => panic!("expected multipart body"),
-        }
-    }
-
-    #[test]
-    fn test_multipart_missing_file_path_error() {
-        let fields = vec!["file=@".to_string()];
-        let err = resolve_multipart(None, &fields).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("missing file path"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_multipart_multiple_fields() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), b"data").unwrap();
-        let path = tmp.path().to_str().unwrap();
-        let fields = vec!["name=test".to_string(), format!("file=@{path}")];
-        let (_method, body) = resolve_multipart(None, &fields).unwrap();
-        match body {
-            HttpRequestBody::Multipart(fields) => assert_eq!(fields.len(), 2),
-            _ => panic!("expected multipart body"),
-        }
     }
 }

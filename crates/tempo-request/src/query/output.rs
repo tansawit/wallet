@@ -1,23 +1,18 @@
 //! Response rendering, receipt display, and file output.
 
-use std::{
-    io::Write,
-    path::{Component, Path},
-};
+use std::fmt::Write as _;
+use std::io::Write;
+use std::path::{Component, Path};
 
-use crate::{
-    args::QueryArgs,
-    http::{format_http_error, print_headers, HttpResponse},
-};
-use tempo_common::{
-    cli::{
-        output::{format_structured_pretty_json, OutputFormat},
-        terminal::hyperlink,
-        Verbosity,
-    },
-    error::{InputError, NetworkError, TempoError},
-    network::NetworkId,
-};
+use anyhow::{Context as _, Result};
+
+use crate::args::QueryArgs;
+use crate::http::{format_http_error, print_headers, HttpResponse};
+use tempo_common::cli::output::{format_structured_pretty_json, OutputFormat};
+use tempo_common::cli::terminal::hyperlink;
+use tempo_common::cli::Verbosity;
+use tempo_common::error::{InputError, NetworkError};
+use tempo_common::network::NetworkId;
 
 /// Output/display options extracted from CLI arguments.
 ///
@@ -36,7 +31,7 @@ pub(crate) struct OutputOptions {
 
 impl OutputOptions {
     /// Whether agent-level log messages should be printed (`-v`).
-    pub(crate) const fn log_enabled(&self) -> bool {
+    pub(crate) fn log_enabled(&self) -> bool {
         self.verbosity.log_enabled()
     }
 }
@@ -71,22 +66,35 @@ pub(crate) fn build_output_options(
     }
 }
 
-/// Handle a final response: render output and fail on HTTP errors.
+/// Handle a final response: render output, optionally save the payment receipt, and fail on HTTP errors.
 pub(crate) fn handle_response(
     output_opts: &OutputOptions,
     response: HttpResponse,
-) -> Result<(), TempoError> {
+    save_receipt_path: Option<&str>,
+) -> Result<()> {
     let status = response.status_code;
+
+    // Capture receipt header before consuming response for output
+    let receipt_hdr =
+        save_receipt_path.and_then(|_| response.header("payment-receipt").map(|s| s.to_string()));
 
     render_response(output_opts, response)?;
 
-    if status >= 400 {
-        return Err(NetworkError::HttpStatus {
-            operation: "handle HTTP response",
-            status,
-            body: Some(format_http_error(status)),
+    // Optionally save receipt JSON if present
+    if let (Some(path), Some(h)) = (save_receipt_path, receipt_hdr.as_ref()) {
+        match mpp::parse_receipt(h) {
+            Ok(receipt) => {
+                let s = serde_json::to_string_pretty(&receipt)?;
+                std::fs::write(path, s)?;
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse receipt for --save-receipt: {e}");
+            }
         }
-        .into());
+    }
+
+    if status >= 400 {
+        anyhow::bail!(NetworkError::Http(format_http_error(status)));
     }
 
     Ok(())
@@ -97,7 +105,7 @@ pub(crate) fn handle_response(
 /// Note: `include_headers` only applies to `Text` format; structured formats
 /// (JSON/TOON) omit the status line and headers from stdout to keep output
 /// machine-parseable. Use `--dump-header` to capture headers separately.
-fn render_response(opts: &OutputOptions, response: HttpResponse) -> Result<(), TempoError> {
+fn render_response(opts: &OutputOptions, response: HttpResponse) -> Result<()> {
     match opts.output_format {
         OutputFormat::Json | OutputFormat::Toon => {
             if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&response.body) {
@@ -133,7 +141,7 @@ fn render_response(opts: &OutputOptions, response: HttpResponse) -> Result<(), T
 }
 
 /// Write raw response bytes to stdout or file (no trailing newline).
-fn write_body(opts: &OutputOptions, body: &[u8]) -> Result<(), TempoError> {
+fn write_body(opts: &OutputOptions, body: &[u8]) -> Result<()> {
     let dest = opts.output_file.as_deref().unwrap_or("-");
     write_to_file(dest, body, opts.log_enabled())
 }
@@ -146,7 +154,7 @@ pub(crate) fn write_meta_if_requested(
     elapsed_ms: u128,
     bytes: usize,
     effective_url: &str,
-) -> Result<(), TempoError> {
+) -> Result<()> {
     if let Some(ref path) = opts.write_meta {
         let hdr_obj: serde_json::Value = headers
             .iter()
@@ -172,10 +180,11 @@ fn write_headers_file(
     status_code: u16,
     headers: &[(String, String)],
     verbose: bool,
-) -> Result<(), TempoError> {
-    let mut content = format!("HTTP {status_code}\n");
+) -> Result<()> {
+    let mut content = String::new();
+    writeln!(content, "HTTP {status_code}").unwrap();
     for (name, value) in headers {
-        content.push_str(&format!("{name}: {value}\n"));
+        writeln!(content, "{name}: {value}").unwrap();
     }
     content.push('\n');
     write_to_file(path, content.as_bytes(), verbose)
@@ -224,24 +233,30 @@ pub(crate) fn display_receipt(
 /// symlinks in the parent directory are resolved to prevent escaping the
 /// working directory. Absolute paths bypass the symlink check (also
 /// matching curl behaviour — the caller explicitly chose the destination).
-fn write_to_file(output_file: &str, data: &[u8], verbose: bool) -> Result<(), TempoError> {
+fn write_to_file(output_file: &str, data: &[u8], verbose: bool) -> Result<()> {
     if output_file == "-" {
-        std::io::stdout().write_all(data)?;
+        std::io::stdout()
+            .write_all(data)
+            .context("Failed to write to stdout")?;
     } else {
         let path = Path::new(output_file);
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(InputError::OutputPathTraversal.into());
+            anyhow::bail!(InputError::InvalidOutputPath(
+                "path traversal (..) not allowed".to_string()
+            ));
         }
         // Resolve symlinks in the parent to prevent escaping the intended directory
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if let Ok(canonical) = parent.canonicalize() {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 if !path.is_absolute() && !canonical.starts_with(&cwd) {
-                    return Err(InputError::OutputPathEscapesWorkingDirectory.into());
+                    anyhow::bail!(InputError::InvalidOutputPath(
+                        "resolved path escapes working directory".to_string()
+                    ));
                 }
             }
         }
-        std::fs::write(output_file, data)?;
+        std::fs::write(output_file, data).context("Failed to write output file")?;
         if verbose {
             eprintln!("Saved to: {output_file}");
         }
@@ -275,14 +290,14 @@ mod tests {
     fn test_handle_response_success_status() {
         let opts = test_opts(false);
         let resp = HttpResponse::for_test(200, b"ok");
-        assert!(handle_response(&opts, resp).is_ok());
+        assert!(handle_response(&opts, resp, None).is_ok());
     }
 
     #[test]
     fn test_handle_response_4xx_fails() {
         let opts = test_opts(false);
         let resp = HttpResponse::for_test(404, b"not found");
-        let err = handle_response(&opts, resp).unwrap_err();
+        let err = handle_response(&opts, resp, None).unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
@@ -290,7 +305,7 @@ mod tests {
     fn test_handle_response_5xx_fails() {
         let opts = test_opts(false);
         let resp = HttpResponse::for_test(500, b"internal error");
-        let err = handle_response(&opts, resp).unwrap_err();
+        let err = handle_response(&opts, resp, None).unwrap_err();
         assert!(err.to_string().contains("Internal Server Error"));
     }
 
@@ -350,8 +365,12 @@ mod tests {
             .collect();
         let cli = Cli::try_parse_from(all).unwrap();
         let query = cli.query;
-        let cli = Cli::try_parse_from(std::iter::once("tempo-request").chain(args.iter().copied()))
-            .unwrap();
+        let cli = Cli::try_parse_from(
+            std::iter::once("tempo-request")
+                .chain(args.iter().copied())
+                .collect::<Vec<&str>>(),
+        )
+        .unwrap();
         (cli, query)
     }
 
@@ -415,21 +434,6 @@ mod tests {
     fn no_output_flags_means_no_file() {
         // Disable auto-JSON so the test works in non-TTY CI environments
         std::env::set_var("TEMPO_NO_AUTO_JSON", "1");
-        // Disable agent-detection so the test works inside LLM agent hosts
-        let saved: Vec<_> = [
-            "AGENT",
-            "CLAUDE_CODE",
-            "CODEX",
-            "AMP_THREAD_ID",
-            "CURSOR_TRACE_ID",
-        ]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
-        .collect();
-        for (k, _) in &saved {
-            std::env::remove_var(k);
-        }
-
         let (c, q) = parse(&["https://example.com/path/file.txt"]);
         let url = Url::parse(&q.url).unwrap();
 
@@ -440,9 +444,6 @@ mod tests {
             &url,
         );
         std::env::remove_var("TEMPO_NO_AUTO_JSON");
-        for (k, v) in &saved {
-            std::env::set_var(k, v);
-        }
         assert!(opts.output_file.is_none());
         assert!(!opts.include_headers);
         assert_eq!(opts.output_format, OutputFormat::Text);

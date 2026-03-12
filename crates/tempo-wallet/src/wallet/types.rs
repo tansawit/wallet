@@ -5,7 +5,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TokenBalance {
     pub symbol: String,
-    pub token: String,
+    pub currency: String,
     pub balance: String,
 }
 
@@ -14,11 +14,11 @@ pub(crate) struct TokenBalance {
 pub(crate) struct SpendingLimitInfo {
     pub unlimited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<String>,
+    pub limit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub remaining: Option<String>,
+    pub remaining: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub spent: Option<String>,
+    pub spent: Option<f64>,
 }
 
 /// Key details for JSON output.
@@ -38,9 +38,9 @@ pub(crate) struct KeyInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub balance: Option<String>,
+    pub balance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spending_limit: Option<SpendingLimitInfo>,
     /// Key expiry as an ISO-8601 UTC timestamp (JSON).
@@ -55,7 +55,7 @@ pub(crate) struct KeysResponse {
 }
 
 impl KeysResponse {
-    pub(crate) const fn new(keys: Vec<KeyInfo>) -> Self {
+    pub(crate) fn new(keys: Vec<KeyInfo>) -> Self {
         let total = keys.len();
         Self { keys, total }
     }
@@ -72,9 +72,9 @@ pub(crate) struct BalanceBreakdown {
 /// Nested balance object for structured JSON output.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct BalanceInfo {
-    pub total: String,
-    pub locked: String,
-    pub available: String,
+    pub total: f64,
+    pub locked: f64,
+    pub available: f64,
     pub active_sessions: usize,
     pub symbol: String,
 }
