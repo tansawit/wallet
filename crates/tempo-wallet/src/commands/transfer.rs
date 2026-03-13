@@ -2,7 +2,7 @@
 
 use alloy::{
     primitives::{
-        utils::{parse_units, ParseUnits},
+        utils::{format_units, parse_units, ParseUnits},
         Address, Bytes, TxKind, U256,
     },
     providers::Provider,
@@ -13,7 +13,7 @@ use serde::Serialize;
 use tempo_primitives::transaction::Call;
 
 use tempo_common::{
-    cli::{context::Context, output},
+    cli::{context::Context as CliContext, output},
     error::{InputError, NetworkError, TempoError},
     payment::session::submit_tempo_tx,
 };
@@ -22,7 +22,7 @@ sol! {
     #[sol(rpc)]
     interface ITIP20 {
         function transfer(address to, uint256 amount) external returns (bool);
-
+        function balanceOf(address account) external view returns (uint256);
         function decimals() external view returns (uint8);
         function symbol() external view returns (string);
     }
@@ -75,8 +75,26 @@ async fn resolve_token(input: &str, provider: &impl Provider) -> Result<Resolved
 
 /// Parse a human amount string into atomic units.
 ///
-/// Supports decimal amounts like "1.00" and "50".
-fn resolve_amount(input: &str, token: &ResolvedToken) -> Result<(U256, String), TempoError> {
+/// Supports decimal amounts like "1.00", "50", and the special value "all"
+/// which transfers the entire balance.
+async fn resolve_amount(
+    input: &str,
+    token: &ResolvedToken,
+    from: Address,
+    provider: &impl Provider,
+) -> Result<(U256, String), TempoError> {
+    if input.eq_ignore_ascii_case("all") {
+        let balance = query_balance(provider, token.address, from).await?;
+        if balance.is_zero() {
+            return Err(InputError::InvalidHexInput(
+                "Balance is zero — nothing to transfer.".to_string(),
+            )
+            .into());
+        }
+        let human = format_units(balance, token.decimals).expect("decimals <= 77");
+        return Ok((balance, human));
+    }
+
     let parsed = parse_units(input, token.decimals)
         .map_err(|_| InputError::InvalidHexInput(format!("Invalid amount: '{input}'")))?;
     let amount = match parsed {
@@ -98,6 +116,24 @@ fn resolve_amount(input: &str, token: &ResolvedToken) -> Result<(U256, String), 
     }
 
     Ok((amount, input.to_string()))
+}
+
+async fn query_balance(
+    provider: &impl Provider,
+    token: Address,
+    account: Address,
+) -> Result<U256, TempoError> {
+    let contract = ITIP20::new(token, provider);
+    let balance =
+        contract
+            .balanceOf(account)
+            .call()
+            .await
+            .map_err(|source| NetworkError::RpcSource {
+                operation: "query token balance",
+                source: Box::new(source),
+            })?;
+    Ok(balance)
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +161,7 @@ struct TransferResponse {
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn run(
-    ctx: &Context,
+    ctx: &CliContext,
     amount: String,
     token_input: String,
     to: String,
@@ -148,7 +184,7 @@ pub(crate) async fn run(
     let token = resolve_token(&token_input, &provider).await?;
 
     // Resolve amount
-    let (amount_atomic, amount_human) = resolve_amount(&amount, &token)?;
+    let (amount_atomic, amount_human) = resolve_amount(&amount, &token, from, &provider).await?;
 
     // Resolve fee token (default: same token as transfer)
     let fee_token_address = if let Some(ref ft) = fee_token_input {
@@ -224,6 +260,14 @@ pub(crate) async fn run(
         calls,
     )
     .await?;
+
+    // Mark provisioned if this was the first tx
+    if !ctx.keys.is_provisioned(ctx.network) {
+        if let Some(wallet_address) = ctx.keys.wallet_address_parsed() {
+            ctx.keys
+                .mark_provisioned_address(ctx.network, wallet_address);
+        }
+    }
 
     let tx_url = ctx.network.tx_url(&tx_hash);
 
