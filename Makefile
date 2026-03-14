@@ -1,4 +1,4 @@
-.PHONY: build release clean check test fix install uninstall run coverage
+.PHONY: build release clean check test fix install uninstall run coverage npm-dev npm-dev-js npm-check npm-check-js
 
 build:
 	cargo build
@@ -44,3 +44,40 @@ fix:
 # Install once: `rustup component add llvm-tools-preview` and `cargo install cargo-llvm-cov`
 coverage:
 	cargo llvm-cov --all-features --workspace --fail-under-lines 85 --lcov --output-path lcov.info
+
+# Build and link npm packages locally for development (via script)
+npm-dev-js:
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-dev node scripts/dev.mjs
+
+# Full npm install smoke test (via script)
+npm-check-js:
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-check node scripts/check.mjs
+
+# Build and link npm packages locally for development
+npm-dev:
+	cargo build --package tempo-wallet --package tempo-request
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-dev node scripts/publish.mjs platform \
+		--os $$(node -e "console.log(process.platform)") \
+		--arch $$(node -e "console.log(process.arch)") \
+		--binaries ../target/debug/tempo-wallet,../target/debug/tempo-request
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-dev node scripts/publish.mjs base
+	cd npm/tempo-$$(node -e "console.log(process.platform)")-$$(node -e "console.log(process.arch)") && npm link
+	cd npm/tempo && npm link @tempoxyz/tempo-$$(node -e "console.log(process.platform)")-$$(node -e "console.log(process.arch)") && npm link
+	@echo "\n✅ Linked. Run: tempo wallet --help"
+
+# Full npm install smoke test (pack + install in tmpdir)
+npm-check:
+	cargo build --package tempo-wallet --package tempo-request
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-check node scripts/publish.mjs platform \
+		--os $$(node -e "console.log(process.platform)") \
+		--arch $$(node -e "console.log(process.arch)") \
+		--binaries ../target/debug/tempo-wallet,../target/debug/tempo-request
+	cd npm && DRY_RUN=1 RELEASE_VERSION=0.0.0-check node scripts/publish.mjs base
+	$(eval TMPDIR := $(shell mktemp -d))
+	cd npm/tempo-$$(node -e "console.log(process.platform)")-$$(node -e "console.log(process.arch)") && npm pack --pack-destination $(TMPDIR)
+	cd npm/tempo && npm pack --pack-destination $(TMPDIR)
+	cd $(TMPDIR) && npm init -y && npm install tempoxyz-tempo-$$(node -e "console.log(process.platform)")-$$(node -e "console.log(process.arch)")-0.0.0-check.tgz tempoxyz-tempo-0.0.0-check.tgz
+	$(TMPDIR)/node_modules/.bin/tempo-wallet --help
+	$(TMPDIR)/node_modules/.bin/tempo-request --help
+	rm -rf $(TMPDIR)
+	@echo "\n✅ npm-check passed"

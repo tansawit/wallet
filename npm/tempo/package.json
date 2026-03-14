@@ -1,0 +1,33 @@
+{
+  "name": "@tempoxyz/tempo",
+  "version": "0.0.0-check",
+  "type": "module",
+  "description": "Tempo CLI — wallet identity, custody, and HTTP client with built-in MPP payments",
+  "bin": {
+    "tempo": "./bin.mjs",
+    "tempo-wallet": "./bin.mjs",
+    "tempo-request": "./bin.mjs"
+  },
+  "files": [
+    "bin.mjs",
+    "const.mjs",
+    "dist"
+  ],
+  "scripts": {
+    "postinstall": "node ./dist/postinstall.mjs"
+  },
+  "optionalDependencies": {
+    "@tempoxyz/tempo-linux-x64": "0.0.0-check",
+    "@tempoxyz/tempo-darwin-x64": "0.0.0-check",
+    "@tempoxyz/tempo-linux-arm64": "0.0.0-check",
+    "@tempoxyz/tempo-darwin-arm64": "0.0.0-check"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tempoxyz/wallet"
+  },
+  "license": "(MIT OR Apache-2.0)"
+}

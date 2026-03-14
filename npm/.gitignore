@@ -1,0 +1,9 @@
+# Generated platform packages
+tempo-*/
+
+# Copied into tempo/ at dev/publish time
+tempo/bin.mjs
+tempo/const.mjs
+tempo/dist/
+
+node_modules/
