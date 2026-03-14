@@ -1,6 +1,6 @@
 {
   "private": true,
-  "name": "tempo-npm",
+  "name": "tempoxyz",
   "description": "npm packaging for Tempo CLI binaries",
   "imports": {
     "#*": "./src/*"
