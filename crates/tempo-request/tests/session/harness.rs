@@ -22,7 +22,7 @@ use tempo_common::keys::parse_private_key_signer;
 use crate::common::test_command;
 use tempo_test::MODERATO_PRIVATE_KEY;
 
-use tempo_common::network::TEMPO_MODERATO_ESCROW;
+pub(crate) const MODERATO_ESCROW: &str = "0x542831e3e4ace07559b7c8787395f4fb99f70787";
 pub(crate) const MODERATO_TOKEN: &str = "0x20c0000000000000000000000000000000000000";
 pub(crate) const PAYEE_A: &str = "0x1111111111111111111111111111111111111111";
 pub(crate) const PAYEE_B: &str = "0x2222222222222222222222222222222222222222";
@@ -307,35 +307,25 @@ fn session_rpc_response(
         "eth_gasPrice" => json!("0x4a817c800"),
         "eth_getBalance" => json!("0xde0b6b3a7640000"),
         "eth_call" => {
-            // balanceOf(address) selector = 0x70a08231
-            let calldata = req["params"][0]["data"]
-                .as_str()
-                .or_else(|| req["params"][0]["input"].as_str())
-                .unwrap_or("");
-
-            if calldata.starts_with("0x70a08231") {
-                json!(format!("0x{:064x}", 10_000_000_u128)) // 10 tokens
-            } else {
-                let mut guard = observations.lock().unwrap();
-                guard.eth_call_count += 1;
-                let mode = match config.channel_mode {
-                    SessionRpcChannelMode::Active => SessionRpcChannelMode::Active,
-                    SessionRpcChannelMode::Missing => SessionRpcChannelMode::Missing,
-                    SessionRpcChannelMode::ActiveThenMissingAfterEthCalls { threshold } => {
-                        if guard.eth_call_count > threshold {
-                            SessionRpcChannelMode::Missing
-                        } else {
-                            SessionRpcChannelMode::Active
-                        }
+            let mut guard = observations.lock().unwrap();
+            guard.eth_call_count += 1;
+            let mode = match config.channel_mode {
+                SessionRpcChannelMode::Active => SessionRpcChannelMode::Active,
+                SessionRpcChannelMode::Missing => SessionRpcChannelMode::Missing,
+                SessionRpcChannelMode::ActiveThenMissingAfterEthCalls { threshold } => {
+                    if guard.eth_call_count > threshold {
+                        SessionRpcChannelMode::Missing
+                    } else {
+                        SessionRpcChannelMode::Active
                     }
-                };
+                }
+            };
 
-                match mode {
-                    SessionRpcChannelMode::Active => json!(encode_active_channel_return_data()),
-                    SessionRpcChannelMode::Missing => json!(encode_missing_channel_return_data()),
-                    SessionRpcChannelMode::ActiveThenMissingAfterEthCalls { .. } => {
-                        unreachable!("mode should be normalized before matching")
-                    }
+            match mode {
+                SessionRpcChannelMode::Active => json!(encode_active_channel_return_data()),
+                SessionRpcChannelMode::Missing => json!(encode_missing_channel_return_data()),
+                SessionRpcChannelMode::ActiveThenMissingAfterEthCalls { .. } => {
+                    unreachable!("mode should be normalized before matching")
                 }
             }
         }
@@ -387,16 +377,15 @@ fn encode_active_channel_return_data() -> String {
     let token = MODERATO_TOKEN.parse().unwrap();
     let authorized_signer = payer;
 
-    // New ABI order: (finalized, closeRequestedAt, payer, payee, token, authorizedSigner, deposit, settled)
     let mut encoded = Vec::with_capacity(32 * 8);
-    encoded.extend(encode_bool_word(false));
-    encoded.extend(encode_u64_word(0));
     encoded.extend(encode_address_word(payer));
     encoded.extend(encode_address_word(payee));
     encoded.extend(encode_address_word(token));
     encoded.extend(encode_address_word(authorized_signer));
     encoded.extend(encode_u128_word(10_000_000));
     encoded.extend(encode_u128_word(0));
+    encoded.extend(encode_u64_word(0));
+    encoded.extend(encode_bool_word(false));
 
     format!("0x{}", hex::encode(encoded))
 }
@@ -409,16 +398,16 @@ fn encode_missing_channel_return_data() -> String {
     let token = MODERATO_TOKEN.parse().unwrap();
     let authorized_signer = payer;
 
-    // New ABI order: (finalized, closeRequestedAt, payer, payee, token, authorizedSigner, deposit, settled)
     let mut encoded = Vec::with_capacity(32 * 8);
-    encoded.extend(encode_bool_word(false));
-    encoded.extend(encode_u64_word(0));
     encoded.extend(encode_address_word(payer));
     encoded.extend(encode_address_word(payee));
     encoded.extend(encode_address_word(token));
     encoded.extend(encode_address_word(authorized_signer));
+
     encoded.extend(encode_u128_word(0));
     encoded.extend(encode_u128_word(0));
+    encoded.extend(encode_u64_word(0));
+    encoded.extend(encode_bool_word(false));
 
     format!("0x{}", hex::encode(encoded))
 }
@@ -482,7 +471,7 @@ async fn session_handler(
             "recipient"
         };
         let mut method_details = serde_json::json!({
-            "escrowContract": TEMPO_MODERATO_ESCROW.to_string(),
+            "escrowContract": MODERATO_ESCROW,
         });
         if !path.contains("missing-chain-id") {
             method_details["chainId"] = serde_json::json!(42431);

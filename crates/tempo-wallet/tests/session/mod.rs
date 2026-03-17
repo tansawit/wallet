@@ -17,7 +17,7 @@ use serde_json::json;
 use super::*;
 use tempo_test::{corrupt_local_session_deposit, seed_local_session};
 
-use tempo_common::network::TEMPO_MODERATO_ESCROW;
+const MODERATO_ESCROW: &str = "0x542831e3e4ace07559b7c8787395f4fb99f70787";
 const MODERATO_TOKEN: &str = "0x20c0000000000000000000000000000000000000";
 const CHANNEL_OPENED_TOPIC: &str =
     "0xcd6e60364f8ee4c2b0d62afc07a1fb04fd267ce94693f93f8f85daaa099b5c94";
@@ -325,16 +325,15 @@ fn encode_get_channel_return_data(close_requested_at: u64, finalized: bool) -> S
     let token: alloy::primitives::Address = MODERATO_TOKEN.parse().unwrap();
     let authorized_signer: alloy::primitives::Address = SEEDED_PAYER.parse().unwrap();
 
-    // New ABI order: (finalized, closeRequestedAt, payer, payee, token, authorizedSigner, deposit, settled)
     let mut encoded = Vec::with_capacity(32 * 8);
-    encoded.extend(encode_bool_word(finalized));
-    encoded.extend(encode_u64_word(close_requested_at));
     encoded.extend(encode_address_word(payer));
     encoded.extend(encode_address_word(payee));
     encoded.extend(encode_address_word(token));
     encoded.extend(encode_address_word(authorized_signer));
     encoded.extend(encode_u128_word(10_000_000));
     encoded.extend(encode_u128_word(0));
+    encoded.extend(encode_u64_word(close_requested_at));
+    encoded.extend(encode_bool_word(finalized));
     format!("0x{}", hex::encode(encoded))
 }
 
@@ -376,7 +375,7 @@ fn channel_opened_log(channel_id: &str) -> serde_json::Value {
 
     json!({
         "removed": false,
-        "address": TEMPO_MODERATO_ESCROW.to_string(),
+        "address": MODERATO_ESCROW,
         "data": format!("0x{}", hex::encode(data)),
         "topics": [
             CHANNEL_OPENED_TOPIC,
@@ -426,7 +425,7 @@ fn seed_session_for_close(
          WHERE channel_id = ?7",
         rusqlite::params![
             request_url,
-            TEMPO_MODERATO_ESCROW.to_string(),
+            MODERATO_ESCROW,
             MODERATO_TOKEN,
             SEEDED_PAYER,
             cumulative_amount.to_string(),
@@ -485,7 +484,7 @@ fn insert_session_for_close(
             channel_id,
             origin,
             request_url,
-            TEMPO_MODERATO_ESCROW.to_string(),
+            MODERATO_ESCROW,
             MODERATO_TOKEN,
             "0x0000000000000000000000000000000000000002",
             SEEDED_PAYER,
